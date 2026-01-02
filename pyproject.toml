@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "rlm-kernel-optimizer"
+version = "0.1.0"
+description = "RLM beam search for CUDA kernel optimization (WaferBench NVFP4)"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26.0",
+    "pinecone>=5.0.0",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.4.0",
+    "flashinfer>=0.2.0",
+]
+
+[project.scripts]
+rlm-optimize = "run:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rlm*", "profiler*", "search*", "eval*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.cuh", "*.cu"]
