@@ -1,0 +1,5 @@
+anthropic>=0.40.0
+pyyaml>=6.0
+numpy>=1.26.0
+pinecone>=5.0.0
+sentence-transformers>=3.0.0
