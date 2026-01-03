@@ -1,0 +1,53 @@
+# NVIDIA B200 Hardware Specification
+hardware:
+  name: "NVIDIA B200"
+  arch: "Blackwell"
+  compute_capability: "10.0"
+
+sm:
+  count: 148                        # actual device query
+  max_threads_per_sm: 2048
+  max_warps_per_sm: 64
+  max_blocks_per_sm: 32
+  warp_size: 32
+
+memory:
+  hbm_bandwidth_tbs: 7.672         # 7672 GB/s measured (2 * 3996MHz * 7680bit / 8)
+  hbm_capacity_gb: 192
+  l2_cache_mb: 126                  # actual device query
+  l1_cache_per_sm_kb: 256           # unified L1/shared
+  shared_memory_per_sm_kb: 228      # max configurable per SM
+  shared_memory_per_block_kb: 48    # actual per-block limit from device query
+
+compute:
+  fp32_tflops: 67.0
+  fp16_tflops: 134.0
+  bf16_tflops: 134.0
+  tf32_tflops: 67.0
+  fp8_tflops: 2200.0
+  nvfp4_tflops: 4400.0           # theoretical peak with TMEM
+  int8_tops: 2200.0
+
+tma:
+  supported: true
+  max_dimensions: 5
+  bulk_copy_alignment_bytes: 16
+  prefetch_distance_bytes: 256
+
+tmem:
+  supported: true
+  capacity_kb_per_sm: 512        # tensor memory per SM
+  access_latency_cycles: 5
+
+warp_features:
+  shfl_supported: true
+  vote_supported: true
+  match_supported: true
+  redux_supported: true
+
+nvfp4:
+  exponent_bits: 1
+  mantissa_bits: 2
+  bias: 1
+  scale_granularity: 16          # per 16 elements
+  packed_elements_per_word: 8    # 2 fp4 per byte, 8 per int32
