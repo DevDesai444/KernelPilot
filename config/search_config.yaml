@@ -1,0 +1,55 @@
+# RLM Beam Search Configuration
+
+models:
+  planner_model: "claude-haiku-4-5-20251001"      # planner agent
+  coder_model: "claude-haiku-4-5-20251001"        # code generation agent
+  fixer_model: "claude-haiku-4-5-20251001"        # repair agent for compile/below-baseline failures
+  root_model: "claude-haiku-4-5-20251001"         # decomposition
+  sub_model: "claude-haiku-4-5-20251001"          # codegen
+  combine_model: "claude-haiku-4-5-20251001"      # combination
+
+beam:
+  width: 1                    # parallel strategy variants
+  refine_rounds: 0            # profiler feedback iterations
+  max_sub_calls_per_round: 2  # cap recursive depth
+  combine_top_k: 2            # merge top-K into final
+  diversity_mode: "family_diverse"  # preserve distinct strategy families
+  tree_speedup_threshold: 1.0 # once a branch clears baseline, expand it via planner tree
+  tree_branching_factor: 2    # child branches created from above-baseline parents
+  family_retire_gap: 0.25     # retire plateaued families if they trail the leader by this much
+  family_retire_ratio: 0.80   # retire plateaued families if they trail the leader by this ratio
+  plateau_refine_attempts: 2  # require at least two failed refinements before retiring a family
+  plateau_bad_rounds: 2       # require repeated stagnant/regression outcomes before pruning
+  max_concurrent_api_calls: 4 # keep planner/coder parallelism aligned with beam width
+  population_crossover: true  # inject one family-distinct crossover candidate per round
+  early_stop_min_improvement: 0.03  # stop if round-over-round best speedup improves by less than this
+
+strategies:
+  enabled:
+    - vectorize_loads
+    - tma_prefetch
+    - warp_reduction
+    - fuse_passes
+    - register_tiling
+    - async_pipeline
+    - fp4_lut
+    - fast_math_expf
+    - thread_coarsening
+    - ldg_readonly
+    - vectorized_stores
+  disabled: []
+
+profiler:
+  tool: "hybrid"
+  warmup_iters: 3
+  profile_iters: 10
+  max_profile_workers: 2
+
+cost_control:
+  max_tokens_per_sub_call: 8192
+  max_total_api_cost_usd: 25.0  # hard stop per kernel problem (Opus is ~5x Sonnet)
+  max_total_cost_all_problems: 100.0
+
+target:
+  min_speedup: 1.5               # target speedup over baseline
+
