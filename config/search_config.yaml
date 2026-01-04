@@ -53,3 +53,52 @@ cost_control:
 target:
   min_speedup: 1.5               # target speedup over baseline
 
+rag:
+  provider: "pinecone"
+  index_name: "cuda-kernels-v2"
+  index_host: "cuda-kernels-v2-69jsi4r.svc.aped-4627-b74a.pinecone.io"
+  top_k: 4
+  candidate_pool_multiplier: 5
+  namespace_env: "PINECONE_NAMESPACE"
+  api_key_env: "PINECONE_API_KEY"
+  index_name_env: "PINECONE_INDEX_NAME"
+  index_host_env: "PINECONE_INDEX_HOST"
+  embed_provider_env: "PINECONE_EMBED_PROVIDER"
+  embed_model_env: "PINECONE_EMBED_MODEL"
+  rerank_model_env: "PINECONE_RERANK_MODEL"
+  rerank_pool: 25
+  source_cap: 1
+  format_max_chars: 16000
+  match_max_chars: 4000
+  text_field: "source_code"
+  title_field: "title"
+  source_field: "source"
+  fields:
+    - "source_code"
+    - "chunk_text"
+    - "title"
+    - "source"
+    - "source_file"
+    - "hardware_target"
+    - "optimization_pattern"
+    - "op_type"
+
+eval:
+  require_flashinfer_baseline: true
+  correctness_atol: 1e-2
+  correctness_rtol: 1e-3
+  correctness_seeds: [42, 123, 999]
+  benchmark_warmup: 500
+  benchmark_iters: 100
+  # Shapes are now per-task (passed via problem_shape in run.py).
+  # These are fallback defaults only — not used during normal WaferBench runs.
+  problem_shapes:
+    - [128, 2048]    # add_rmsnorm_fp4quant_b128xh2048
+    - [128, 4096]    # add_rmsnorm_fp4quant_b128xh4096
+    - [128, 8192]    # add_rmsnorm_fp4quant_b128xh8192
+
+output:
+  save_all_candidates: true
+  save_profiler_reports: true
+  output_dir: "outputs/"
+  log_level: "INFO"
