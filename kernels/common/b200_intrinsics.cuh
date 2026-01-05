@@ -42,3 +42,71 @@ __device__ __forceinline__ void tma_load_1d(
         : "memory"
     );
 }
+
+// Initialize mbarrier for TMA completion tracking
+__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t num_transactions) {
+    asm volatile (
+        "mbarrier.init.shared::cta.b64 [%0], %1;"
+        : : "r"((uint32_t)__cvta_generic_to_shared(mbar)), "r"(num_transactions)
+        : "memory"
+    );
+}
+
+// Wait for mbarrier (TMA completion)
+__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {
+    asm volatile (
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "WAIT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+        "@!p bra WAIT;\n\t"
+        "}"
+        : : "r"((uint32_t)__cvta_generic_to_shared(mbar)), "r"(phase)
+        : "memory"
+    );
+}
+
+// Arrive at mbarrier (for thread-block synchronization)
+__device__ __forceinline__ void mbar_arrive(uint64_t* mbar) {
+    asm volatile (
+        "mbarrier.arrive.shared::cta.b64 _, [%0];"
+        : : "r"((uint32_t)__cvta_generic_to_shared(mbar))
+        : "memory"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Software pipeline helper — double-buffered shared memory prefetch
+// Usage:
+//   PipelineState pipe;
+//   pipe.issue_prefetch(stage0_buf, gmem_ptr, nbytes, mbar);
+//   pipe.wait(mbar);
+//   ... consume stage0_buf ...
+//   pipe.issue_prefetch(stage1_buf, next_ptr, nbytes, mbar);
+//   pipe.swap();
+// ────────────────────────────────────────────────────────────────────────────
+struct PipelineState {
+    uint32_t phase = 0;
+    uint32_t stage = 0;
+
+    __device__ __forceinline__ void issue_prefetch(
+        void* smem_buf,
+        const void* gmem_src,
+        uint32_t num_bytes,
+        uint64_t* mbar)
+    {
+        mbar_init(mbar, 1);
+        if (threadIdx.x == 0) {
+            tma_load_1d(smem_buf, gmem_src, mbar, num_bytes);
+        }
+    }
+
+    __device__ __forceinline__ void wait(uint64_t* mbar) {
+        mbar_wait(mbar, phase);
+    }
+
+    __device__ __forceinline__ void swap() {
+        stage ^= 1;
+        phase ^= 1;
+    }
+};
