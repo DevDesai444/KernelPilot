@@ -110,3 +110,66 @@ struct PipelineState {
         phase ^= 1;
     }
 };
+
+// ────────────────────────────────────────────────────────────────────────────
+// Vectorized global memory loads — 128-bit aligned
+// ────────────────────────────────────────────────────────────────────────────
+
+__device__ __forceinline__ float4 load_float4(const float* ptr) {
+    return *reinterpret_cast<const float4*>(ptr);
+}
+
+__device__ __forceinline__ void store_float4(float* ptr, float4 val) {
+    *reinterpret_cast<float4*>(ptr) = val;
+}
+
+__device__ __forceinline__ uint4 load_uint4(const uint32_t* ptr) {
+    return *reinterpret_cast<const uint4*>(ptr);
+}
+
+// Load 16 bytes (128 bits) as __nv_bfloat162 x4
+__device__ __forceinline__ void load_bf16x8(
+    const __nv_bfloat16* ptr,
+    __nv_bfloat162& a, __nv_bfloat162& b,
+    __nv_bfloat162& c, __nv_bfloat162& d)
+{
+    uint4 raw = load_uint4(reinterpret_cast<const uint32_t*>(ptr));
+    a = *reinterpret_cast<__nv_bfloat162*>(&raw.x);
+    b = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
+    c = *reinterpret_cast<__nv_bfloat162*>(&raw.z);
+    d = *reinterpret_cast<__nv_bfloat162*>(&raw.w);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TMEM access helpers (Blackwell tensor memory — on-chip scratchpad)
+// TMEM sits between L1 and registers; ~5 cycle latency, 512KB per SM
+// ────────────────────────────────────────────────────────────────────────────
+
+// Allocate TMEM region (must be called by elected thread in block)
+__device__ __forceinline__ uint32_t tmem_alloc(uint32_t num_bytes) {
+    uint32_t tmem_addr;
+    asm volatile (
+        "tcgen05.alloc.cta_group::1.sync.aligned.b32 %0, %1;"
+        : "=r"(tmem_addr)
+        : "r"(num_bytes)
+    );
+    return tmem_addr;
+}
+
+// Free TMEM region
+__device__ __forceinline__ void tmem_free(uint32_t tmem_addr) {
+    asm volatile (
+        "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0;"
+        : : "r"(tmem_addr)
+    );
+}
+
+// Load from TMEM into register
+__device__ __forceinline__ uint32_t tmem_load(uint32_t tmem_addr) {
+    uint32_t val;
+    asm volatile (
+        "tcgen05.ld.sync.aligned.32b.x1.b32 %0, [%1];"
+        : "=r"(val) : "r"(tmem_addr)
+    );
+    return val;
+}
