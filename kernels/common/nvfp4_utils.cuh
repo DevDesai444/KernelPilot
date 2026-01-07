@@ -91,3 +91,97 @@ __device__ __constant__ float kNVFP4LUT[16] = {
    -0.0f,  -0.5f,  -1.0f,  -1.5f,  // 0b1000 .. 0b1011  (negative, exp=0)
    -2.0f,  -3.0f,  -4.0f,  -6.0f,  // 0b1100 .. 0b1111  (negative, exp=1)
 };
+
+// ────────────────────────────────────────────────────────────────────────────
+// Core encode: float → 4-bit code (two-step: clamp → scale → round-to-nearest)
+//
+// NVFP4 positive magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+// The spacing between levels is non-uniform (0.5 up to 2, then 1, then 2).
+// We map the scaled value to the nearest representable level using a lookup
+// into 8 boundary midpoints, which avoids a 16-iteration linear scan and
+// gives the compiler a branchless cmov sequence instead.
+//
+// Boundary midpoints between consecutive positive levels:
+//   0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0  (7 thresholds for 8 levels)
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
+    // Extract sign and work with |x| scaled to [0, 6] range
+    uint8_t sign_bit = (x < 0.0f) ? 0x8u : 0x0u;
+    float   ax       = fabsf(x);
+
+    // Clamp to representable range [0, 6]
+    ax = fminf(ax, 6.0f);
+
+    // Map magnitude to 3-bit mantissa+exponent code (0..7 → levels 0,0.5,1,1.5,2,3,4,6)
+    // Threshold comparisons collapse to a sequence of SETP/SELP on B200 PTX
+    uint8_t code;
+    if      (ax < 0.25f) code = 0;   // → 0.0
+    else if (ax < 0.75f) code = 1;   // → 0.5
+    else if (ax < 1.25f) code = 2;   // → 1.0
+    else if (ax < 1.75f) code = 3;   // → 1.5
+    else if (ax < 2.5f)  code = 4;   // → 2.0
+    else if (ax < 3.5f)  code = 5;   // → 3.0
+    else if (ax < 5.0f)  code = 6;   // → 4.0
+    else                 code = 7;   // → 6.0
+
+    return sign_bit | code;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Hardware FP4 pair conversion (sm_100a+): 2 scaled floats → 1 packed byte
+// Usage: pack_fp4_pair(val0 * inv_scale, val1 * inv_scale)
+// Values must be pre-scaled to [-6, 6] range before calling.
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ uint8_t pack_fp4_pair(float a, float b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return (uint8_t)__nv_cvt_float2_to_fp4x2(make_float2(a, b), __NV_E2M1, cudaRoundNearest);
+#else
+    return (float_to_nvfp4(b) << 4) | (float_to_nvfp4(a) & 0xF);
+#endif
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Core decode: 4-bit code → float
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ float nvfp4_to_float(uint8_t code) {
+    return kNVFP4LUT[code & 0xF];
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Block quantize: 16 floats → 8 bytes (packed fp4) + 1 E4M3 scale
+// Input:  float x[16]
+// Output: uint8_t packed[8], __nv_fp8_storage_t scale (E4M3)
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ void quantize_block_nvfp4(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ packed,
+    __nv_fp8_storage_t* __restrict__ scale)
+{
+    // Find block absmax for scaling
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+
+    // Scale so that max maps to representable NVFP4 max (6.0)
+    const float inv_max_repr = 1.0f / 6.0f;
+    float s = (amax > 0.0f) ? (amax * inv_max_repr) : 1.0f;
+    *scale = float_to_e4m3(s);
+
+    float inv_s = (amax > 0.0f) ? (6.0f / amax) : 1.0f;
+
+    // Encode each element and pack 2 fp4 per byte
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+        // Hardware FP4 conversion — single instruction per pair on sm_100a
+        float2 pair = make_float2(x[2*i] * inv_s, x[2*i+1] * inv_s);
+        packed[i] = (uint8_t)__nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
+#else
+        uint8_t lo = float_to_nvfp4(x[2*i]   * inv_s);
+        uint8_t hi = float_to_nvfp4(x[2*i+1] * inv_s);
+        packed[i] = (hi << 4) | (lo & 0xF);
+#endif
+    }
+}
