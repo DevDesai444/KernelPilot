@@ -173,3 +173,38 @@ __device__ __forceinline__ uint32_t tmem_load(uint32_t tmem_addr) {
     );
     return val;
 }
+
+// Store register to TMEM
+__device__ __forceinline__ void tmem_store(uint32_t tmem_addr, uint32_t val) {
+    asm volatile (
+        "tcgen05.st.sync.aligned.32b.x1.b32 [%0], %1;"
+        : : "r"(tmem_addr), "r"(val)
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Utility: elect one thread in a warp for TMA issue
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ bool is_warp_leader() {
+    return (threadIdx.x % 32) == 0;
+}
+
+__device__ __forceinline__ bool is_block_leader() {
+    return threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Cache control
+// ────────────────────────────────────────────────────────────────────────────
+
+// Evict from L1 (streaming load — don't pollute L1 cache)
+__device__ __forceinline__ float load_streaming(const float* ptr) {
+    float val;
+    asm volatile ("ld.global.cs.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
+    return val;
+}
+
+// L2 prefetch hint
+__device__ __forceinline__ void prefetch_l2(const void* ptr) {
+    asm volatile ("prefetch.global.L2 [%0];" : : "l"(ptr));
+}
