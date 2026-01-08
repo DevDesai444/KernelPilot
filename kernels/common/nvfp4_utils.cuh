@@ -185,3 +185,62 @@ __device__ __forceinline__ void quantize_block_nvfp4(
 #endif
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Block dequantize: 8 bytes (packed fp4) + E4M3 scale → 16 floats
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ void dequantize_block_nvfp4(
+    const uint8_t* __restrict__ packed,
+    __nv_fp8_storage_t scale,
+    float* __restrict__ out)
+{
+    float s = e4m3_to_float(scale);
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+        uint8_t byte = packed[i];
+        out[2*i]   = nvfp4_to_float(byte & 0xF)  * s;
+        out[2*i+1] = nvfp4_to_float(byte >> 4)   * s;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Vectorized pack: 8 fp4 codes → single int32 (for register-level ops)
+// Layout: bits [3:0]=code0, [7:4]=code1, ..., [31:28]=code7
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ uint32_t pack8_nvfp4(const uint8_t codes[8]) {
+    uint32_t result = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        result |= ((uint32_t)(codes[i] & 0xF)) << (i * 4);
+    }
+    return result;
+}
+
+__device__ __forceinline__ void unpack8_nvfp4(uint32_t packed, uint8_t codes[8]) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        codes[i] = (packed >> (i * 4)) & 0xF;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Warp-level absmax reduction (for block scale computation across warp)
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ float warp_absmax(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val = fmaxf(val, fabsf(__shfl_xor_sync(0xFFFFFFFF, val, mask)));
+    }
+    return val;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Warp-level sum reduction
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, mask);
+    }
+    return val;
+}
