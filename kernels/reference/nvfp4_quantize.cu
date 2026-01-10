@@ -58,3 +58,56 @@ __device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
 
     return sign_bit | code;
 }
+
+// ── Naive quantize kernel ───────────────────────────────────────────────────
+// One thread per 16-element quant block. Scalar loads, no vectorization.
+
+#define BLOCK_THREADS 256
+
+__global__ void nvfp4_quantize_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    uint8_t*             __restrict__ packed,
+    __nv_fp8_storage_t*  __restrict__ scales,
+    int N)
+{
+    int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = N / NVFP4_BLOCK_SIZE;
+    if (block_id >= num_blocks) return;
+
+    int base = block_id * NVFP4_BLOCK_SIZE;
+    float x[NVFP4_BLOCK_SIZE];
+
+    // Scalar loads
+    for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i)
+        x[i] = __bfloat162float(input[base + i]);
+
+    // Find block absmax
+    float amax = 0.0f;
+    for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i)
+        amax = fmaxf(amax, fabsf(x[i]));
+
+    // Compute E4M3 scale
+    float s = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
+    __nv_fp8_storage_t scale_e4m3 = float_to_e4m3(s);
+    float inv_s = (amax > 0.0f) ? (6.0f / amax) : 1.0f;
+
+    // Pack FP4 pairs into bytes
+    int packed_base = block_id * (NVFP4_BLOCK_SIZE / 2);
+    for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+        uint8_t lo = float_to_nvfp4(x[2*i]   * inv_s);
+        uint8_t hi = float_to_nvfp4(x[2*i+1] * inv_s);
+        packed[packed_base + i] = (hi << 4) | (lo & 0xF);
+    }
+    scales[block_id] = scale_e4m3;
+}
+
+// Host launch wrapper — signature must not change
+void launch_nvfp4_quantize_bf16(
+    const __nv_bfloat16* input, uint8_t* packed, __nv_fp8_storage_t* scales,
+    int N, cudaStream_t stream)
+{
+    int num_blocks = N / NVFP4_BLOCK_SIZE;
+    dim3 grid((num_blocks + BLOCK_THREADS - 1) / BLOCK_THREADS);
+    nvfp4_quantize_bf16_kernel<<<grid, BLOCK_THREADS, 0, stream>>>(
+        input, packed, scales, N);
+}
