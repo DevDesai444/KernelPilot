@@ -71,3 +71,96 @@ def _check_input_poison(src: str) -> HackDetectionResult:
     return HackDetectionResult(True, "input_poison", "clean")
 
 
+def _check_null_output(src: str) -> HackDetectionResult:
+    """Kernel writes a constant (0, 1) to output without reading inputs."""
+    # Output filled with constant and no bfloat16 conversion from input
+    writes_zero = bool(re.search(
+        r"output\s*\[.*\]\s*=\s*(__float2bfloat16\s*\(\s*0\.0|0\s*;)", src))
+    reads_input = bool(re.search(
+        r"__bfloat162float\s*\(\s*(input|in|residual|res)\s*\[", src))
+    if writes_zero and not reads_input:
+        return HackDetectionResult(False, "null_output",
+            "Output filled with constant and input never read")
+    return HackDetectionResult(True, "null_output", "clean")
+
+
+def _check_cache_thrash(src: str) -> HackDetectionResult:
+    """Kernel explicitly flushes caches between iterations to inflate speedup."""
+    patterns = [
+        r"cudaDeviceSynchronize\s*\(\s*\).*cudaMemset",
+        r"__threadfence_system",
+        r"asm\s*volatile.*\"discard\"",
+        r"cudaMemPrefetchAsync.*cudaCpuDeviceId",
+    ]
+    for p in patterns:
+        if re.search(p, src, re.DOTALL):
+            return HackDetectionResult(False, "cache_thrash",
+                f"Cache flush pattern detected: {p}")
+    return HackDetectionResult(True, "cache_thrash", "clean")
+
+
+def _check_timing_hook(src: str) -> HackDetectionResult:
+    """Kernel reads GPU clock to detect when it's being timed and skips work."""
+    patterns = [
+        r"\bclock\s*\(\s*\)",
+        r"\bclock64\s*\(\s*\)",
+        r"__clock\b",
+        r"globaltimer",
+        r"asm.*\"mov.*%clock\"",
+        r"asm.*\"mov.*%clock64\"",
+    ]
+    for p in patterns:
+        if re.search(p, src):
+            return HackDetectionResult(False, "timing_hook",
+                f"GPU clock intrinsic detected: {p}")
+    return HackDetectionResult(True, "timing_hook", "clean")
+
+
+def _check_nan_inf_output(src: str) -> HackDetectionResult:
+    """Kernel intentionally writes NaN or Inf (exploit if correctness skipped)."""
+    patterns = [
+        r"\bNAN\b",
+        r"\bINFINITY\b",
+        r"\bHUGE_VALF\b",
+        r"__int_as_float\s*\(\s*0x7f800000\s*\)",   # +Inf bit pattern
+        r"__int_as_float\s*\(\s*0x7fc00000\s*\)",   # NaN bit pattern
+        r"1\.0f\s*/\s*0\.0f",
+    ]
+    for p in patterns:
+        if re.search(p, src):
+            return HackDetectionResult(False, "nan_inf_output",
+                f"NaN/Inf literal detected: {p}")
+    return HackDetectionResult(True, "nan_inf_output", "clean")
+
+
+def _check_pointer_alias(src: str) -> HackDetectionResult:
+    """Kernel copies output pointer to input to create false in-place aliasing."""
+    patterns = [
+        r"(input|in)\s*=\s*(output|out)\s*;",
+        r"(residual|res)\s*=\s*(output|out)\s*;",
+        r"const_cast\s*<.*>\s*\(\s*(output|out)\s*\)",
+    ]
+    for p in patterns:
+        if re.search(p, src):
+            return HackDetectionResult(False, "pointer_alias",
+                f"Pointer aliasing detected: {p}")
+    return HackDetectionResult(True, "pointer_alias", "clean")
+
+
+def _check_precision_downgrade(src: str) -> HackDetectionResult:
+    """Kernel downcasts to fp16 mid-computation then upcasts back to bf16/fp32."""
+    patterns = [
+        r"__float2half\s*\(",
+        r"__half2float\s*\(",
+        r"\bhalf\b.*=.*\bfloat\b",
+        r"__nv_half",
+        r"fp16.*accumul",
+        r"half_t",
+    ]
+    for p in patterns:
+        if re.search(p, src):
+            return HackDetectionResult(False, "precision_downgrade",
+                f"fp16 intermediate detected (precision downgrade): {p}")
+    return HackDetectionResult(True, "precision_downgrade", "clean")
+
+
