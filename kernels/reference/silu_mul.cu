@@ -59,3 +59,63 @@ __device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
 
     return sign_bit | code;
 }
+
+// ── Naive fused kernel ──────────────────────────────────────────────────────
+// One thread per 16-element quant block. Scalar loads, no vectorization.
+
+#define BLOCK_THREADS 128
+
+__global__ void silu_mul_fp4quant_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    uint8_t*             __restrict__ quant_out,
+    __nv_fp8_storage_t*  __restrict__ quant_scales,
+    int N)
+{
+    int num_quant_blocks = N / NVFP4_BLOCK_SIZE;
+    int qb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qb >= num_quant_blocks) return;
+
+    int elem_base = qb * NVFP4_BLOCK_SIZE;
+    float block_vals[NVFP4_BLOCK_SIZE];
+
+    // Compute SiLU(gate) * up for each element
+    for (int j = 0; j < NVFP4_BLOCK_SIZE; ++j) {
+        float g = __bfloat162float(gate[elem_base + j]);
+        float u = __bfloat162float(up[elem_base + j]);
+        float silu = g / (1.0f + expf(-g));
+        block_vals[j] = silu * u;
+    }
+
+    // Find block absmax
+    float amax = 0.0f;
+    for (int j = 0; j < NVFP4_BLOCK_SIZE; ++j)
+        amax = fmaxf(amax, fabsf(block_vals[j]));
+
+    // Compute E4M3 scale
+    float s = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
+    __nv_fp8_storage_t scale_e4m3 = float_to_e4m3(s);
+    float inv_s = (amax > 0.0f) ? (6.0f / amax) : 1.0f;
+
+    // Pack FP4 pairs into bytes
+    int packed_base = qb * (NVFP4_BLOCK_SIZE / 2);
+    for (int j = 0; j < NVFP4_BLOCK_SIZE / 2; ++j) {
+        uint8_t lo = float_to_nvfp4(block_vals[2*j]   * inv_s);
+        uint8_t hi = float_to_nvfp4(block_vals[2*j+1] * inv_s);
+        quant_out[packed_base + j] = (hi << 4) | (lo & 0xF);
+    }
+    quant_scales[qb] = scale_e4m3;
+}
+
+// Host launch wrapper — signature must not change
+void launch_silu_mul_fp4quant(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    uint8_t* quant_out, __nv_fp8_storage_t* quant_scales,
+    int N, cudaStream_t stream)
+{
+    int num_quant_blocks = N / NVFP4_BLOCK_SIZE;
+    dim3 grid((num_quant_blocks + BLOCK_THREADS - 1) / BLOCK_THREADS);
+    dim3 block(BLOCK_THREADS);
+    silu_mul_fp4quant_kernel<<<grid, block, 0, stream>>>(
+        gate, up, quant_out, quant_scales, N);
+}
