@@ -164,3 +164,56 @@ def _check_precision_downgrade(src: str) -> HackDetectionResult:
     return HackDetectionResult(True, "precision_downgrade", "clean")
 
 
+def _check_library_call(src: str) -> HackDetectionResult:
+    """Kernel delegates to optimized library instead of implementing the op."""
+    patterns = [
+        r"\bcublas\w+\s*\(",
+        r"\bcublasLt\w+\s*\(",
+        r"\bcudnn\w+\s*\(",
+        r"\bcufft\w+\s*\(",
+        r"\bthrust::",
+        r"#include\s*[<\"]cublas",
+        r"#include\s*[<\"]cudnn",
+        r"#include\s*[<\"]cufft",
+    ]
+    for p in patterns:
+        if re.search(p, src):
+            return HackDetectionResult(False, "library_call",
+                f"External library call detected: {p}")
+    return HackDetectionResult(True, "library_call", "clean")
+
+
+# All 9 static checks in order
+_CHECKS = [
+    _check_early_exit,
+    _check_input_poison,
+    _check_null_output,
+    _check_cache_thrash,
+    _check_timing_hook,
+    _check_nan_inf_output,
+    _check_pointer_alias,
+    _check_precision_downgrade,
+    _check_library_call,
+]
+
+
+def detect_hacks(kernel_src: str) -> list[HackDetectionResult]:
+    """Run all 7 checks. Returns list of results (one per check)."""
+    results = [check(kernel_src) for check in _CHECKS]
+    failed  = [r for r in results if not r.passed]
+    if failed:
+        for r in failed:
+            logger.warning("HACK DETECTED [%s]: %s", r.hack_type, r.detail)
+    return results
+
+
+def is_clean(kernel_src: str) -> tuple[bool, str]:
+    """
+    Convenience wrapper. Returns (clean, hack_type_or_empty).
+    hack_type is empty string if clean.
+    """
+    results = detect_hacks(kernel_src)
+    failed  = [r for r in results if not r.passed]
+    if failed:
+        return False, failed[0].hack_type
+    return True, ""
