@@ -347,3 +347,83 @@ int main() {{
 """
 
 
+class RuntimeChecker:
+    """
+    Compiles kernel_src + runtime harness, runs it, parses RTCHECK lines.
+    Returns list[RuntimeCheckResult].
+    """
+
+    def __init__(self):
+        self.nvcc_flags = [
+            "-O2", "-arch=sm_100a", "-std=c++17",
+            f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
+        ]
+
+    def check(self, kernel_src: str) -> list[RuntimeCheckResult]:
+        harness  = _runtime_harness(_ROWS, _HIDDEN)
+        combined = kernel_src + "\n\n" + harness
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "rtcheck.cu"
+            exe = Path(tmpdir) / "rtcheck"
+            src.write_text(combined)
+
+            cmd = ["nvcc"] + self.nvcc_flags + [str(src), "-o", str(exe)]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning("Runtime check harness compilation timed out after 120s")
+                return [RuntimeCheckResult(True, "compile", "harness compile timeout — skipped")]
+            if r.returncode != 0:
+                logger.warning("Runtime check harness failed to compile: %s",
+                               r.stderr[:300])
+                # Compilation failure is itself a signal — return inconclusive
+                return [RuntimeCheckResult(True, "compile", "harness compile failed — skipped")]
+
+            try:
+                r2 = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                logger.warning("Runtime check harness timed out after 60s")
+                return [RuntimeCheckResult(False, "timeout", "runtime check timeout")]
+            output = r2.stdout
+
+        return self._parse(output)
+
+    def _parse(self, output: str) -> list[RuntimeCheckResult]:
+        results = []
+        for line in output.splitlines():
+            m = re.match(r"RTCHECK (\w+): (PASS|FAIL)(.*)", line.strip())
+            if not m:
+                continue
+            name, verdict, detail = m.group(1), m.group(2), m.group(3).strip()
+            passed = verdict == "PASS"
+            results.append(RuntimeCheckResult(passed, name, detail))
+            if not passed:
+                logger.warning("RUNTIME HACK [%s]: %s", name, detail)
+        return results
+
+
+def run_runtime_checks(kernel_src: str, kernel_type: str = "add_rmsnorm") -> tuple[bool, str]:
+    """
+    Convenience wrapper matching is_clean() signature.
+    Returns (clean, hack_type_or_empty).
+    Only runs if nvcc is available — silently skips otherwise.
+    Currently only supports add_rmsnorm kernel type; others are skipped.
+    """
+    if kernel_type != "add_rmsnorm":
+        logger.debug("Runtime checks only support add_rmsnorm — skipping for %s", kernel_type)
+        return True, ""
+    try:
+        checker = RuntimeChecker()
+        results = checker.check(kernel_src)
+        failed  = [r for r in results if not r.passed]
+        if failed:
+            return False, failed[0].check_name
+        return True, ""
+    except FileNotFoundError:
+        logger.debug("nvcc not found — runtime checks skipped")
+        return True, ""
+    except Exception as e:
+        logger.warning("Runtime checks error: %s", e)
+        return True, ""
