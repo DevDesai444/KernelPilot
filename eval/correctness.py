@@ -54,3 +54,148 @@ def _generate_flashinfer_harness(kernel_type: str, shape: tuple,
     return None
 
 
+def _flashinfer_harness_add_rmsnorm(shape: tuple, ref_dir: str,
+                                     atol: float, rtol: float) -> str:
+    rows, hidden = shape
+    n = rows * hidden
+    nb = n // 16
+    qblocks_per_row = hidden // 16
+    return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+{_cuda_harness_prelude()}
+
+void launch_fused_add_rmsnorm_nvfp4(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
+
+/* FP4 decode LUT: codes 0-7 positive, 8-15 negative */
+static const float kFP4LUT[16] = {{
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+   -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+}};
+
+static float decode_e4m3(unsigned char x) {{
+    unsigned int sign = (x & 0x80u);
+    unsigned int exp  = (x >> 3) & 0xFu;
+    unsigned int mant = x & 0x7u;
+    float val;
+    if (exp == 0u) val = (mant / 8.0f) * (1.0f / 64.0f);
+    else           val = (1.0f + mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+    return sign ? -val : val;
+}}
+
+static void load_bf16(const char* path, __nv_bfloat16* dst, int n) {{
+    FILE* f = fopen(path, "rb");
+    if (!f) {{ fprintf(stderr, "Cannot open %s\\n", path); exit(1); }}
+    fread(dst, 2, n, f); fclose(f);
+}}
+
+int main() {{
+    const int rows={rows}, hidden={hidden}, N={n}, NB={nb};
+    const int qb_per_row = {qblocks_per_row};
+
+    __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(N*2);
+    __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(N*2);
+    __nv_bfloat16 *h_w   = (__nv_bfloat16*)malloc(hidden*2);
+    __nv_bfloat16 *h_ref_ro = (__nv_bfloat16*)malloc(N*2);
+    __nv_bfloat16 *h_ref_no = (__nv_bfloat16*)malloc(N*2);
+
+    load_bf16("{ref_dir}/input.bin",        h_in,     N);
+    load_bf16("{ref_dir}/residual.bin",     h_res,    N);
+    load_bf16("{ref_dir}/weight.bin",       h_w,      hidden);
+    load_bf16("{ref_dir}/residual_out.bin", h_ref_ro, N);
+    load_bf16("{ref_dir}/norm_out.bin",     h_ref_no, N);
+
+    __nv_bfloat16 *di, *dr, *dw, *dro;
+    unsigned char *dq; __nv_fp8_storage_t *ds;
+    cudaMalloc(&di, N*2); cudaMemcpy(di, h_in, N*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&dr, N*2); cudaMemcpy(dr, h_res, N*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&dw, hidden*2); cudaMemcpy(dw, h_w, hidden*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&dro, N*2);
+    cudaMalloc(&dq, N/2);
+    cudaMalloc(&ds, NB);
+
+    cudaStream_t s; cudaStreamCreate(&s);
+    launch_fused_add_rmsnorm_nvfp4(di, dr, dw, dro, dq, ds, rows, hidden, s);
+    cudaStreamSynchronize(s);
+
+    /* --- Check 1: residual_out (bf16 exact) --- */
+    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(N*2);
+    cudaMemcpy(h_out, dro, N*2, cudaMemcpyDeviceToHost);
+
+    float maxe_ro = 0.f; int miss_ro = 0;
+    for (int i = 0; i < N; ++i) {{
+        float ref = __bfloat162float(h_ref_ro[i]);
+        float can = __bfloat162float(h_out[i]);
+        float e = fabsf(ref - can);
+        if (e > maxe_ro) maxe_ro = e;
+        if (e > {atol}f + {rtol}f * fabsf(ref)) miss_ro++;
+    }}
+
+    if (miss_ro > 0) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f mismatches=%d/%d residual_out mismatch)\\n",
+               maxe_ro, miss_ro, N);
+        return 1;
+    }}
+
+    /* --- Check 2: FP4 quantized output (dequant vs norm_out) --- */
+    unsigned char *h_qo = (unsigned char*)malloc(N/2);
+    unsigned char *h_sc = (unsigned char*)malloc(NB);
+    cudaMemcpy(h_qo, dq, N/2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc, ds, NB, cudaMemcpyDeviceToHost);
+
+    float maxe_q = 0.f; int miss_q = 0; int zero_blocks = 0;
+
+    for (int idx = 0; idx < NB; ++idx) {{
+        int r  = idx / qb_per_row;
+        int qb = idx % qb_per_row;
+        float scale = decode_e4m3(h_sc[idx]);
+        float tol = fmaxf(scale * 1.5f, 0.01f);
+        int packed_base = idx * 8;
+        int elem_base   = r * hidden + qb * 16;
+
+        int all_zero = 1;
+        for (int j = 0; j < 8; ++j) {{
+            unsigned char byte = h_qo[packed_base + j];
+            float lo = kFP4LUT[byte & 0xF] * scale;
+            float hi = kFP4LUT[byte >> 4]  * scale;
+            if (lo != 0.0f || hi != 0.0f) all_zero = 0;
+
+            float ref_lo = __bfloat162float(h_ref_no[elem_base + 2*j]);
+            float ref_hi = __bfloat162float(h_ref_no[elem_base + 2*j + 1]);
+            float e_lo = fabsf(ref_lo - lo);
+            float e_hi = fabsf(ref_hi - hi);
+            if (e_lo > maxe_q) maxe_q = e_lo;
+            if (e_hi > maxe_q) maxe_q = e_hi;
+            if (e_lo > tol) miss_q++;
+            if (e_hi > tol) miss_q++;
+        }}
+        if (all_zero) zero_blocks++;
+    }}
+
+    float zero_frac = (float)zero_blocks / NB;
+    if (zero_frac > 0.5f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f quant_zero_blocks=%.0f%% — FP4 output is empty)\\n",
+               maxe_q, zero_frac * 100.f);
+        return 1;
+    }}
+
+    float miss_q_frac = (float)miss_q / N;
+    if (miss_q_frac > 0.05f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f quant_mismatches=%d/%d (%.1f%%) — FP4 output wrong)\\n",
+               maxe_q, miss_q, N, miss_q_frac * 100.f);
+        return 1;
+    }}
+
+    printf("CORRECTNESS: PASS (max_abs_err=%.6f N=%d quant_err=%.4f quant_zero=%d/%d)\\n",
+           maxe_ro, N, maxe_q, zero_blocks, NB);
+    return 0;
+}}
+"""
+
+
