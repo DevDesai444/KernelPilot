@@ -320,3 +320,115 @@ int main() {{
 """
 
 
+def _flashinfer_harness_nvfp4_quantize(shape: tuple, ref_dir: str,
+                                        atol: float, rtol: float) -> str:
+    m, k = shape
+    n = m * k
+    nb = n // 16
+    return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+{_cuda_harness_prelude()}
+
+void launch_nvfp4_quantize_bf16(
+    const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
+
+/* FP4 decode LUT */
+static const float kFP4LUT[16] = {{
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+   -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+}};
+
+static float decode_e4m3(unsigned char x) {{
+    unsigned int sign = (x & 0x80u);
+    unsigned int exp  = (x >> 3) & 0xFu;
+    unsigned int mant = x & 0x7u;
+    float val;
+    if (exp == 0u) val = (mant / 8.0f) * (1.0f / 64.0f);
+    else           val = (1.0f + mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+    return sign ? -val : val;
+}}
+
+static void load_bf16(const char* path, __nv_bfloat16* dst, int n) {{
+    FILE* f = fopen(path, "rb");
+    if (!f) {{ fprintf(stderr, "Cannot open %s\\n", path); exit(1); }}
+    fread(dst, 2, n, f); fclose(f);
+}}
+
+int main() {{
+    const int N={n}, NB={nb};
+
+    __nv_bfloat16 *h_in = (__nv_bfloat16*)malloc(N*2);
+    load_bf16("{ref_dir}/input.bin", h_in, N);
+
+    __nv_bfloat16 *din; uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    cudaMalloc(&din, N*2); cudaMemcpy(din, h_in, N*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&dpk, N/2);
+    cudaMalloc(&dsc, NB);
+
+    cudaStream_t s; cudaStreamCreate(&s);
+    launch_nvfp4_quantize_bf16(din, dpk, dsc, N, s);
+    cudaStreamSynchronize(s);
+
+    /* Copy back quantized output */
+    unsigned char *h_packed = (unsigned char*)malloc(N/2);
+    unsigned char *h_scales = (unsigned char*)malloc(NB);
+    cudaMemcpy(h_packed, dpk, N/2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, dsc, NB, cudaMemcpyDeviceToHost);
+
+    /* Dequant FP4 and compare against original input (round-trip check) */
+    float maxe = 0.0f; int miss = 0; int zero_blocks = 0;
+
+    for (int blk = 0; blk < NB; ++blk) {{
+        float scale = decode_e4m3(h_scales[blk]);
+        /* FP4 max quantization error = scale * 1.0 (half the largest step) */
+        float tol = fmaxf(scale * 1.5f, 0.01f);
+        int packed_base = blk * 8;
+        int elem_base   = blk * 16;
+
+        int all_zero = 1;
+        for (int j = 0; j < 8; ++j) {{
+            unsigned char byte = h_packed[packed_base + j];
+            float dq_lo = kFP4LUT[byte & 0xF] * scale;
+            float dq_hi = kFP4LUT[byte >> 4]  * scale;
+            if (dq_lo != 0.0f || dq_hi != 0.0f) all_zero = 0;
+
+            float ref_lo = __bfloat162float(h_in[elem_base + 2*j]);
+            float ref_hi = __bfloat162float(h_in[elem_base + 2*j + 1]);
+            float e_lo = fabsf(ref_lo - dq_lo);
+            float e_hi = fabsf(ref_hi - dq_hi);
+            if (e_lo > maxe) maxe = e_lo;
+            if (e_hi > maxe) maxe = e_hi;
+            if (e_lo > tol) miss++;
+            if (e_hi > tol) miss++;
+        }}
+        if (all_zero) zero_blocks++;
+    }}
+
+    /* Reject if >50% of blocks are all-zero (likely no-op kernel) */
+    float zero_frac = (float)zero_blocks / NB;
+    if (zero_frac > 0.5f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f zero_blocks=%.0f%% — FP4 output is empty)\\n",
+               maxe, zero_frac * 100.f);
+        return 1;
+    }}
+
+    float miss_frac = (float)miss / N;
+    if (miss_frac > 0.05f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f mismatches=%d/%d (%.1f%%) — quantization mismatch)\\n",
+               maxe, miss, N, miss_frac * 100.f);
+        return 1;
+    }}
+
+    printf("CORRECTNESS: PASS (max_abs_err=%.6f N=%d zero_blocks=%d/%d)\\n",
+           maxe, N, zero_blocks, NB);
+    return 0;
+}}
+"""
+
+
