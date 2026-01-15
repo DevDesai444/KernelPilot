@@ -199,3 +199,124 @@ int main() {{
 """
 
 
+def _flashinfer_harness_silu_mul(shape: tuple, ref_dir: str,
+                                  atol: float, rtol: float) -> str:
+    b, m, k = shape
+    n = b * m * k
+    nb = n // 16
+    return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+{_cuda_harness_prelude()}
+
+void launch_silu_mul_fp4quant(
+    const __nv_bfloat16*, const __nv_bfloat16*,
+    uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
+
+/* FP4 decode LUT */
+static const float kFP4LUT[16] = {{
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+   -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+}};
+
+static float decode_e4m3(unsigned char x) {{
+    unsigned int sign = (x & 0x80u);
+    unsigned int exp  = (x >> 3) & 0xFu;
+    unsigned int mant = x & 0x7u;
+    float val;
+    if (exp == 0u) val = (mant / 8.0f) * (1.0f / 64.0f);
+    else           val = (1.0f + mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+    return sign ? -val : val;
+}}
+
+static void load_bf16(const char* path, __nv_bfloat16* dst, int n) {{
+    FILE* f = fopen(path, "rb");
+    if (!f) {{ fprintf(stderr, "Cannot open %s\\n", path); exit(1); }}
+    fread(dst, 2, n, f); fclose(f);
+}}
+
+int main() {{
+    const int N={n}, NB={nb};
+
+    __nv_bfloat16 *h_gate = (__nv_bfloat16*)malloc(N*2);
+    __nv_bfloat16 *h_up   = (__nv_bfloat16*)malloc(N*2);
+    load_bf16("{ref_dir}/gate.bin", h_gate, N);
+    load_bf16("{ref_dir}/up.bin",   h_up,   N);
+
+    __nv_bfloat16 *dg, *du;
+    uint8_t *dq; __nv_fp8_storage_t *ds;
+    cudaMalloc(&dg, N*2); cudaMemcpy(dg, h_gate, N*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&du, N*2); cudaMemcpy(du, h_up,   N*2, cudaMemcpyHostToDevice);
+    cudaMalloc(&dq, N/2);
+    cudaMalloc(&ds, NB);
+
+    cudaStream_t s; cudaStreamCreate(&s);
+    launch_silu_mul_fp4quant(dg, du, dq, ds, N, s);
+    cudaStreamSynchronize(s);
+
+    /* Copy back quantized output */
+    unsigned char *h_packed = (unsigned char*)malloc(N/2);
+    unsigned char *h_scales = (unsigned char*)malloc(NB);
+    cudaMemcpy(h_packed, dq, N/2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, ds, NB, cudaMemcpyDeviceToHost);
+
+    /* Dequant FP4 output and compare against expected silu(gate)*up */
+    float maxe = 0.0f; int miss = 0; int zero_blocks = 0;
+
+    for (int blk = 0; blk < NB; ++blk) {{
+        float scale = decode_e4m3(h_scales[blk]);
+        float tol = fmaxf(scale * 1.5f, 0.01f);
+        int packed_base = blk * 8;
+        int elem_base   = blk * 16;
+
+        int all_zero = 1;
+        for (int j = 0; j < 8; ++j) {{
+            unsigned char byte = h_packed[packed_base + j];
+            float dq_lo = kFP4LUT[byte & 0xF] * scale;
+            float dq_hi = kFP4LUT[byte >> 4]  * scale;
+            if (dq_lo != 0.0f || dq_hi != 0.0f) all_zero = 0;
+
+            /* Expected: silu(gate) * up = gate / (1 + exp(-gate)) * up */
+            float g0 = __bfloat162float(h_gate[elem_base + 2*j]);
+            float u0 = __bfloat162float(h_up[elem_base + 2*j]);
+            float exp0 = g0 / (1.0f + expf(-g0)) * u0;
+
+            float g1 = __bfloat162float(h_gate[elem_base + 2*j + 1]);
+            float u1 = __bfloat162float(h_up[elem_base + 2*j + 1]);
+            float exp1 = g1 / (1.0f + expf(-g1)) * u1;
+
+            float e0 = fabsf(exp0 - dq_lo);
+            float e1 = fabsf(exp1 - dq_hi);
+            if (e0 > maxe) maxe = e0;
+            if (e1 > maxe) maxe = e1;
+            if (e0 > tol) miss++;
+            if (e1 > tol) miss++;
+        }}
+        if (all_zero) zero_blocks++;
+    }}
+
+    float zero_frac = (float)zero_blocks / NB;
+    if (zero_frac > 0.5f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f zero_blocks=%.0f%% — FP4 output is empty)\\n",
+               maxe, zero_frac * 100.f);
+        return 1;
+    }}
+
+    float miss_frac = (float)miss / N;
+    if (miss_frac > 0.05f) {{
+        printf("CORRECTNESS: FAIL (max_abs_err=%.6f mismatches=%d/%d (%.1f%%) — silu*mul+quant mismatch)\\n",
+               maxe, miss, N, miss_frac * 100.f);
+        return 1;
+    }}
+
+    printf("CORRECTNESS: PASS (max_abs_err=%.6f N=%d zero_blocks=%d/%d)\\n",
+           maxe, N, zero_blocks, NB);
+    return 0;
+}}
+"""
+
+
