@@ -528,3 +528,74 @@ int main() {{
 """
 
 
+class CorrectnessChecker:
+
+    def __init__(self, config: dict):
+        self.atol = config["eval"]["correctness_atol"]
+        self.rtol = config["eval"]["correctness_rtol"]
+        seeds_cfg = config["eval"].get("correctness_seeds", [42, 123, 999])
+        if isinstance(seeds_cfg, int):
+            self.correctness_seeds = [42 + idx for idx in range(max(1, seeds_cfg))]
+        else:
+            self.correctness_seeds = [int(seed) for seed in seeds_cfg] or [42]
+        self.nvcc_flags = [
+            "-O2", "-arch=sm_100a", "-std=c++17",
+            f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
+        ]
+
+    def check(self, candidate_src: str, problem_shape: tuple,
+              kernel_type: str = "add_rmsnorm") -> tuple:
+        """Returns (passed, max_abs_err, message)."""
+        clean, hack_type = is_clean(candidate_src)
+        if not clean:
+            return False, float("inf"), f"Hack detected: {hack_type}"
+
+        # Try FlashInfer reference first
+        if flashinfer_ref.available():
+            return self._check_with_flashinfer(candidate_src, problem_shape, kernel_type)
+
+        # Fallback to CUDA reference (add_rmsnorm only)
+        if kernel_type == "add_rmsnorm":
+            return self._check_with_cuda_ref(candidate_src, problem_shape)
+
+        return False, float("inf"), f"No reference available for {kernel_type} (install flashinfer)"
+
+    def _check_with_flashinfer(self, candidate_src: str, shape: tuple,
+                                kernel_type: str) -> tuple:
+        """Check correctness using FlashInfer-generated reference data."""
+        import torch
+
+        last_err = float("inf")
+        last_msg = "FlashInfer reference unavailable"
+        for seed in self.correctness_seeds:
+            ref_data = flashinfer_ref.generate_reference(kernel_type, shape, seed=seed)
+            if ref_data is None:
+                logger.warning("FlashInfer reference generation failed for seed %s", seed)
+                if kernel_type == "add_rmsnorm":
+                    return self._check_with_cuda_ref(candidate_src, shape)
+                return False, float("inf"), "FlashInfer reference unavailable"
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for name, tensor in ref_data.items():
+                    if isinstance(tensor, torch.Tensor):
+                        with open(f"{tmpdir}/{name}.bin", "wb") as bf:
+                            bf.write(
+                                tensor.cpu().contiguous().numpy(force=True).tobytes()
+                                if tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+                                else bytes(tensor.cpu().contiguous().untyped_storage())
+                            )
+
+                harness = _generate_flashinfer_harness(kernel_type, shape, tmpdir,
+                                                        self.atol, self.rtol)
+                if harness is None:
+                    return False, float("inf"), f"No harness for {kernel_type}"
+
+                passed, err, msg = self._compile_and_run(candidate_src, harness, tmpdir)
+                if not passed:
+                    return False, err, f"seed={seed} {msg}"
+                last_err = err
+                last_msg = msg
+
+        return True, last_err, f"{last_msg} seeds={self.correctness_seeds}"
+
