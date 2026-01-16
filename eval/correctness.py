@@ -599,3 +599,42 @@ class CorrectnessChecker:
 
         return True, last_err, f"{last_msg} seeds={self.correctness_seeds}"
 
+    def _check_with_cuda_ref(self, candidate_src: str, shape: tuple) -> tuple:
+        """Fallback: check using hand-written CUDA reference kernel."""
+        rows, hidden = shape
+        harness = _generate_cuda_reference_harness(rows, hidden, self.atol, self.rtol)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return self._compile_and_run(candidate_src, harness, tmpdir)
+
+    def _compile_and_run(self, candidate_src: str, harness: str, tmpdir: str) -> tuple:
+        """Compile candidate + harness and run correctness check."""
+        combined_src = candidate_src + "\n\n" + harness
+        src_file = Path(tmpdir) / "correctness_check.cu"
+        bin_file = Path(tmpdir) / "correctness_check"
+        src_file.write_text(combined_src)
+
+        cmd = ["nvcc"] + self.nvcc_flags + [str(src_file), "-o", str(bin_file)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return False, float("inf"), "Compile timed out after 120s"
+        if r.returncode != 0:
+            return False, float("inf"), f"Compile failed: {r.stderr[:300]}"
+
+        try:
+            r2 = subprocess.run([str(bin_file)], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return False, float("inf"), "Kernel hung (timeout) — likely deadlock or infinite loop"
+        output = r2.stdout.strip()
+
+        if "PASS" in output:
+            m = re.search(r"max_abs_err=([\d.]+)", output)
+            err = float(m.group(1)) if m else 0.0
+            return True, err, output
+        elif "FAIL" in output:
+            m = re.search(r"max_abs_err=([\d.]+)", output)
+            err = float(m.group(1)) if m else float("inf")
+            return False, err, output
+        else:
+            return False, float("inf"), f"Unexpected output: {output}"
