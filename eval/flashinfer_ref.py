@@ -93,3 +93,60 @@ def _jit_warmup():
     logger.info("FlashInfer JIT warmup complete")
 
 
+def measure_baseline(kernel_type: str, shape: tuple) -> Optional[float]:
+    """Measure FlashInfer baseline timing in microseconds.
+
+    Returns None if FlashInfer is not available.
+    """
+    if not available():
+        return None
+
+    _jit_warmup()
+
+    try:
+        if kernel_type == "add_rmsnorm":
+            return _baseline_add_rmsnorm(shape)
+        elif kernel_type == "silu_mul":
+            return _baseline_silu_mul(shape)
+        elif kernel_type == "nvfp4_quantize":
+            return _baseline_nvfp4_quantize(shape)
+        else:
+            logger.warning("Unknown kernel_type for FlashInfer baseline: %s", kernel_type)
+            return None
+    except Exception as e:
+        logger.warning("FlashInfer baseline measurement failed: %s", e)
+        return None
+
+
+def measure_baseline_with_source(kernel_type: str, shape: tuple) -> tuple[Optional[float], str]:
+    """Measure the official baseline and report where it came from."""
+    baseline = measure_baseline(kernel_type, shape)
+    if baseline is not None:
+        return baseline, "flashinfer"
+    return None, "unavailable"
+
+
+def generate_reference(kernel_type: str, shape: tuple, seed: int = 42) -> Optional[dict]:
+    """Generate reference output tensors using FlashInfer.
+
+    Returns dict with input/output torch tensors, or None if unavailable.
+    """
+    if not available():
+        return None
+
+    try:
+        if kernel_type == "add_rmsnorm":
+            return _reference_add_rmsnorm(shape, seed)
+        elif kernel_type == "silu_mul":
+            return _reference_silu_mul(shape, seed)
+        elif kernel_type == "nvfp4_quantize":
+            return _reference_nvfp4_quantize(shape, seed)
+        else:
+            return None
+    except Exception as e:
+        logger.warning("FlashInfer reference generation failed: %s", e)
+        return None
+
+
+# ── Add + RMSNorm + FP4 Quant ────────────────────────────────────────────────
+
