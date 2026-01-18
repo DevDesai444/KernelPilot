@@ -227,3 +227,89 @@ def _baseline_silu_mul(shape: tuple) -> float:
         return _time_fn(run, nbufs=nbufs)
 
 
+def _reference_silu_mul(shape: tuple, seed: int) -> dict:
+    b, m, k = shape
+    torch.manual_seed(seed)
+    gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    combined = torch.cat([gate, up], dim=-1)  # (B*M, 2*K)
+    out  = flashinfer.silu_and_mul(combined)
+    return {"gate": gate.flatten(), "up": up.flatten(), "output": out.flatten()}
+
+
+# ── NVFP4 Quantize ──────────────────────────────────────────────────────────
+
+def _baseline_nvfp4_quantize(shape: tuple) -> float:
+    m, k = shape
+    input_bytes = m * k * 2  # input bf16
+    nbufs = _compute_l2_cycle_bufs(input_bytes)
+    inps = []
+    for i in range(nbufs):
+        torch.manual_seed(i)
+        inps.append(torch.randn(m, k, dtype=torch.bfloat16, device="cuda"))
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    def run(buf_idx):
+        flashinfer.fp4_quantize(inps[buf_idx], global_scale=global_scale)
+
+    return _time_fn(run, nbufs=nbufs)
+
+
+def _reference_nvfp4_quantize(shape: tuple, seed: int) -> dict:
+    m, k = shape
+    torch.manual_seed(seed)
+    inp = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    packed, scales = flashinfer.fp4_quantize(inp, global_scale=global_scale)
+    return {"input": inp, "packed": packed, "scales": scales}
+
+
+# ── Timing utility ───────────────────────────────────────────────────────────
+
+def _time_fn(fn, nbufs: int = 4, warmup: int = _WARMUP_ITERS,
+             iters: int = _BENCH_ITERS) -> float:
+    """Time a function with L2 cache cycling. Returns microseconds per call.
+
+    Captures a CUDA graph containing all iterations with L2-cycling buffer
+    rotation baked in.  Graph replay eliminates Python dispatch overhead
+    (~3-5µs/call) that would otherwise crush speedup ratios on micro-kernels.
+
+    Must stay symmetric with benchmark.py's _time_via_extension (also uses
+    CUDA graph + dynamic nbufs) so baseline/candidate comparison is fair.
+
+    fn(buf_idx) is called with a rotating buffer index to cycle L2.
+    """
+    # Warmup with L2 cycling (Python loop — overhead doesn't matter here)
+    for i in range(warmup):
+        fn(i % nbufs)
+    torch.cuda.synchronize()
+
+    # Capture CUDA graph with L2-cycling buffer sequence
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(iters):
+            fn(i % nbufs)
+    s.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for i in range(iters):
+            fn(i % nbufs)
+
+    # Warm the graph replay
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Timed graph replay — zero Python overhead, L2 cycling preserved
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    g.replay()
+    end.record()
+    torch.cuda.synchronize()
+
+    ms = start.elapsed_time(end)
+    return ms * 1000.0 / iters  # convert ms → µs per iteration
