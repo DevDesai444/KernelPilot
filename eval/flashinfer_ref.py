@@ -150,3 +150,80 @@ def generate_reference(kernel_type: str, shape: tuple, seed: int = 42) -> Option
 
 # ── Add + RMSNorm + FP4 Quant ────────────────────────────────────────────────
 
+def _baseline_add_rmsnorm(shape: tuple) -> float:
+    rows, hidden = shape
+    input_bytes = rows * hidden * 2 * 2 + hidden * 2  # (input+residual)*bf16 + weight
+    nbufs = _compute_l2_cycle_bufs(input_bytes)
+    inps, ress = [], []
+    for i in range(nbufs):
+        torch.manual_seed(i)
+        inps.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
+        ress.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
+    w = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
+
+    def run(buf_idx):
+        flashinfer.add_rmsnorm_fp4quant(inps[buf_idx], ress[buf_idx], w, eps=1e-6)
+
+    return _time_fn(run, nbufs=nbufs)
+
+
+def _reference_add_rmsnorm(shape: tuple, seed: int) -> dict:
+    rows, hidden = shape
+    torch.manual_seed(seed)
+    inp = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    res = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    w   = torch.ones(hidden, dtype=torch.bfloat16, device="cuda") + \
+          torch.rand(hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # FlashInfer's fused_add_rmsnorm modifies inp in-place (residual_out = inp + res)
+    inp_copy = inp.clone()
+    res_copy = res.clone()
+    flashinfer.fused_add_rmsnorm(inp_copy, res_copy, w, eps=1e-6)
+
+    return {
+        "input": inp, "residual": res, "weight": w,
+        "residual_out": res_copy, "norm_out": inp_copy,
+    }
+
+
+# ── SiLU × Mul + FP4 Quant ──────────────────────────────────────────────────
+
+def _baseline_silu_mul(shape: tuple) -> float:
+    b, m, k = shape
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    if _HAS_FUSED_SILU:
+        # KernelArena reference: single fused kernel (3D expert-batched, swizzled)
+        input_bytes = b * m * 2 * k * 2  # (B, M, 2*K) bf16
+        nbufs = _compute_l2_cycle_bufs(input_bytes)
+        xs = []
+        for i in range(nbufs):
+            torch.manual_seed(i)
+            xs.append(torch.randn(b, m, 2 * k, dtype=torch.bfloat16, device="cuda"))
+        mask = torch.full((b,), m, dtype=torch.int64, device="cuda")
+
+        def run(buf_idx):
+            flashinfer.silu_and_mul_scaled_nvfp4_experts_quantize(
+                xs[buf_idx], mask, global_scale
+            )
+
+        return _time_fn(run, nbufs=nbufs)
+    else:
+        # Fallback: two separate calls (NOT comparable to KernelArena)
+        logger.warning("Using unfused silu_mul baseline — speedup NOT comparable to KernelArena")
+        input_bytes = b * m * k * 2 * 2  # gate + up bf16
+        nbufs = _compute_l2_cycle_bufs(input_bytes)
+        combineds = []
+        for i in range(nbufs):
+            torch.manual_seed(i)
+            gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+            up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+            combineds.append(torch.cat([gate, up], dim=-1))
+
+        def run(buf_idx):
+            out = flashinfer.silu_and_mul(combineds[buf_idx])
+            flashinfer.fp4_quantize(out, global_scale=global_scale)
+
+        return _time_fn(run, nbufs=nbufs)
+
+
