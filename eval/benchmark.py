@@ -120,3 +120,102 @@ class Benchmarker:
             logger.warning("PyTorch extension timing failed (%s), trying C++ fallback", e)
             return self._time_via_binary(kernel_src, shape)
 
+    def _time_via_extension(self, kernel_src: str, shape: tuple) -> Optional[float]:
+        """Load kernel as PyTorch extension and time through Python loop."""
+        import torch
+        from torch.utils.cpp_extension import load_inline
+
+        bridge_code = self._c_bridge(shape)
+        wrapper_code = self._pybind_wrapper(shape)
+        cuda_src = kernel_src + "\n\n" + bridge_code
+
+        # Unique name based on source hash to avoid stale cache
+        src_hash = hashlib.md5(cuda_src.encode()).hexdigest()[:12]
+        mod_name = f"bench_{self.kernel_type}_{src_hash}"
+
+        if DEBUG_BENCHMARK_KERNEL_SRC:
+            print("\n" + "=" * 80)
+            print(f"DEBUG: Printing generated kernel source for shape {shape}")
+            print("=" * 80)
+            print(kernel_src)
+            print("=" * 80 + "\n")
+
+        cuda_cflags = [
+            "-O3",
+            "-arch=sm_100a",
+            "--use_fast_math",
+            "-std=c++17",
+            # PyTorch JIT may inject *_NO_HALF* / *_NO_BFLOAT16_* defines.
+            # Explicitly undefine them so bf16/half intrinsics match the direct nvcc path.
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+        ] + [f"-I{d}" for d in self.include_dirs]
+
+        logger.info(
+            "JIT extension compile: TORCH_CUDA_ARCH_LIST=%s flags=%s",
+            os.getenv("TORCH_CUDA_ARCH_LIST", "<unset>"),
+            " ".join(cuda_cflags),
+        )
+
+        module = load_inline(
+            name=mod_name,
+            cuda_sources=[cuda_src],
+            cpp_sources=[wrapper_code],
+            extra_cuda_cflags=cuda_cflags,
+            verbose=False,
+        )
+
+        # Dynamic L2 cache cycling (KernelArena methodology)
+        input_bytes = self._input_bytes(shape)
+        nbufs = self._compute_l2_cycle_bufs(input_bytes)
+        input_sets = []
+        for i in range(nbufs):
+            torch.manual_seed(42 + i)
+            input_sets.append(self._create_inputs(shape))
+        outputs = self._create_outputs(shape)
+
+        def run(buf_idx):
+            module.run_kernel(*input_sets[buf_idx], *outputs)
+
+        # Warmup with L2 cycling (Python loop — overhead doesn't matter here)
+        for i in range(self.warmup):
+            run(i % nbufs)
+        torch.cuda.synchronize()
+
+        # Capture CUDA graph with L2-cycling buffer sequence.
+        # The graph bakes in the exact pointer sequence run(0),run(1),...,run(nbufs-1),...
+        # so L2 cycling is preserved. Graph replay has ZERO Python dispatch overhead,
+        # eliminating the ~3-5µs/call Pybind11 boundary crossing that crushes speedup ratios.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for i in range(self.iters):
+                run(i % nbufs)
+        s.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for i in range(self.iters):
+                run(i % nbufs)
+
+        # Warm the graph replay (first replay may have overhead)
+        for _ in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+
+        # Timed graph replay — zero Python overhead, L2 cycling preserved
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        g.replay()
+        end.record()
+        torch.cuda.synchronize()
+
+        ms = start.elapsed_time(end)
+        return ms * 1000.0 / self.iters  # µs per iteration
+
+    # ── C bridge: extern "C" void* wrapper in CUDA source ────────────────────
+
