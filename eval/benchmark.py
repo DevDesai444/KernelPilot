@@ -447,3 +447,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     # ── C++ harness generators (fallback only) ───────────────────────────────
 
+    def _build_harness(self, shape: tuple) -> str:
+        if self.kernel_type == "add_rmsnorm":
+            return self._harness_add_rmsnorm(shape)
+        elif self.kernel_type == "silu_mul":
+            return self._harness_silu_mul(shape)
+        elif self.kernel_type == "nvfp4_quantize":
+            return self._harness_nvfp4_quantize(shape)
+        else:
+            raise ValueError(f"Unknown kernel_type: {self.kernel_type}")
+
+    def _timing_footer(self, launch_call_indexed: str, iters: int, warmup: int) -> str:
+        return f"""
+    // Warmup with L2 cycling
+    for(int i=0;i<{warmup};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
+    cudaStreamSynchronize(s);
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0,s);
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
+    cudaEventRecord(t1,s); cudaStreamSynchronize(s);
+    float ms_event=0; cudaEventElapsedTime(&ms_event,t0,t1);
+    float us_event=ms_event*1000.f/{iters};
+    cudaDeviceSynchronize();
+    struct timespec ts0,ts1; clock_gettime(CLOCK_MONOTONIC,&ts0);
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
+    cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC,&ts1);
+    double wall_ns=(ts1.tv_sec-ts0.tv_sec)*1e9+(ts1.tv_nsec-ts0.tv_nsec);
+    float us_wall=(float)(wall_ns/1000.0/{iters});
+    float ratio=(us_event>0)?us_wall/us_event:1.f;
+    printf("timing_us: %.3f\\n",us_event);
+    printf("timing_wall_us: %.3f\\n",us_wall);
+    printf("timing_ratio: %.3f\\n",ratio);
+    printf("l2_cycle_bufs: %d\\n",nbufs);
+    if(ratio>1.5f) printf("TIMING_ANOMALY: event=%.3fus wall=%.3fus ratio=%.2fx\\n",us_event,us_wall,ratio);
+"""
+
+    @staticmethod
