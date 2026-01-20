@@ -219,3 +219,71 @@ class Benchmarker:
 
     # ── C bridge: extern "C" void* wrapper in CUDA source ────────────────────
 
+    def _c_bridge(self, shape: tuple) -> str:
+        if self.kernel_type == "add_rmsnorm":
+            return self._c_bridge_add_rmsnorm(shape)
+        elif self.kernel_type == "silu_mul":
+            return self._c_bridge_silu_mul(shape)
+        elif self.kernel_type == "nvfp4_quantize":
+            return self._c_bridge_nvfp4_quantize(shape)
+        raise ValueError(f"Unknown kernel_type: {self.kernel_type}")
+
+    def _c_bridge_add_rmsnorm(self, shape: tuple) -> str:
+        rows, hidden = shape
+        return f"""
+extern "C" void bench_launch(
+    void* input, void* residual, void* weight,
+    void* residual_out, void* quant_out, void* scales, void* stream) {{
+    launch_fused_add_rmsnorm_nvfp4(
+        (const __nv_bfloat16*)input,
+        (const __nv_bfloat16*)residual,
+        (const __nv_bfloat16*)weight,
+        (__nv_bfloat16*)residual_out,
+        (unsigned char*)quant_out,
+        (__nv_fp8_storage_t*)scales,
+        {rows}, {hidden}, (cudaStream_t)stream);
+}}
+"""
+
+    def _c_bridge_silu_mul(self, shape: tuple) -> str:
+        b, m, k = shape
+        n = b * m * k
+        return f"""
+extern "C" void bench_launch(
+    void* gate, void* up,
+    void* quant_out, void* scales, void* stream) {{
+    launch_silu_mul_fp4quant(
+        (const __nv_bfloat16*)gate,
+        (const __nv_bfloat16*)up,
+        (uint8_t*)quant_out,
+        (__nv_fp8_storage_t*)scales,
+        {n}, (cudaStream_t)stream);
+}}
+"""
+
+    def _c_bridge_nvfp4_quantize(self, shape: tuple) -> str:
+        m, k = shape
+        n = m * k
+        return f"""
+extern "C" void bench_launch(
+    void* input,
+    void* packed, void* scales, void* stream) {{
+    launch_nvfp4_quantize_bf16(
+        (const __nv_bfloat16*)input,
+        (uint8_t*)packed,
+        (__nv_fp8_storage_t*)scales,
+        {n}, (cudaStream_t)stream);
+}}
+"""
+
+    # ── Pybind11 wrapper: C++ source with torch::Tensor args ─────────────────
+
+    def _pybind_wrapper(self, shape: tuple) -> str:
+        if self.kernel_type == "add_rmsnorm":
+            return self._pybind_add_rmsnorm()
+        elif self.kernel_type == "silu_mul":
+            return self._pybind_silu_mul()
+        elif self.kernel_type == "nvfp4_quantize":
+            return self._pybind_nvfp4_quantize()
+        raise ValueError(f"Unknown kernel_type: {self.kernel_type}")
+
