@@ -377,3 +377,73 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 torch.randn(m * k, dtype=torch.bfloat16, device="cuda"),
             )
 
+    def _create_outputs(self, shape: tuple):
+        """Create output tensors on GPU (shared across L2-cycle buffers)."""
+        import torch
+        if self.kernel_type == "add_rmsnorm":
+            rows, hidden = shape
+            n = rows * hidden
+            nb = n // 16
+            return (
+                torch.empty(n, dtype=torch.bfloat16, device="cuda"),       # residual_out
+                torch.empty(n // 2, dtype=torch.uint8, device="cuda"),     # quant_out (packed FP4)
+                torch.empty(nb, dtype=torch.uint8, device="cuda"),         # scales (FP8 E4M3)
+            )
+        elif self.kernel_type == "silu_mul":
+            b, m, k = shape
+            n = b * m * k
+            nb = n // 16
+            return (
+                torch.empty(n // 2, dtype=torch.uint8, device="cuda"),     # quant_out
+                torch.empty(nb, dtype=torch.uint8, device="cuda"),         # scales
+            )
+        elif self.kernel_type == "nvfp4_quantize":
+            m, k = shape
+            n = m * k
+            nb = n // 16
+            return (
+                torch.empty(n // 2, dtype=torch.uint8, device="cuda"),     # packed
+                torch.empty(nb, dtype=torch.uint8, device="cuda"),         # scales
+            )
+
+    # ── Fallback: C++ binary timing (used when PyTorch unavailable) ──────────
+
+    def _time_via_binary(self, kernel_src: str, shape: tuple) -> Optional[float]:
+        """Fallback: compile to standalone binary and time in C++.
+
+        WARNING: This path has lower dispatch overhead than the Python-based
+        FlashInfer baseline, producing inflated speedup numbers. Only used
+        when torch.utils.cpp_extension is unavailable.
+        """
+        logger.warning("Using C++ binary timing fallback — speedups will be inflated vs baseline")
+        harness  = self._build_harness(shape)
+        combined = kernel_src + "\n\n" + harness
+        nvcc_flags = [
+            "-O3", "-arch=sm_100a", "--use_fast_math", "-std=c++17",
+        ] + [f"-I{d}" for d in self.include_dirs]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "bench.cu"
+            exe = Path(tmpdir) / "bench"
+            src.write_text(combined)
+            cmd = ["nvcc"] + nvcc_flags + [str(src), "-o", str(exe)]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning("Benchmark compile timed out after 120s for shape %s", shape)
+                return None
+            if r.returncode != 0:
+                return None
+            try:
+                r2 = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                logger.warning("Benchmark run timed out after 60s for shape %s", shape)
+                return None
+            output = r2.stdout
+            if "TIMING_ANOMALY" in output:
+                logger.warning("Timing anomaly detected (event/wall ratio > 1.5x): %s",
+                               re.search(r"TIMING_ANOMALY:.*", output).group(0))
+            m = re.search(r"timing_us:\s*([\d.]+)", output)
+            return float(m.group(1)) if m else None
+
+    # ── C++ harness generators (fallback only) ───────────────────────────────
+
