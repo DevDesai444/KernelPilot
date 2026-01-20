@@ -287,3 +287,93 @@ extern "C" void bench_launch(
             return self._pybind_nvfp4_quantize()
         raise ValueError(f"Unknown kernel_type: {self.kernel_type}")
 
+    def _pybind_add_rmsnorm(self) -> str:
+        return """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+extern "C" void bench_launch(void*, void*, void*, void*, void*, void*, void*);
+
+void run_kernel(
+    torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+    torch::Tensor residual_out, torch::Tensor quant_out, torch::Tensor scales) {
+    void* stream = (void*)at::cuda::getCurrentCUDAStream().stream();
+    bench_launch(
+        input.data_ptr(), residual.data_ptr(), weight.data_ptr(),
+        residual_out.data_ptr(), quant_out.data_ptr(), scales.data_ptr(),
+        stream);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("run_kernel", &run_kernel);
+}
+"""
+
+    def _pybind_silu_mul(self) -> str:
+        return """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+extern "C" void bench_launch(void*, void*, void*, void*, void*);
+
+void run_kernel(
+    torch::Tensor gate, torch::Tensor up,
+    torch::Tensor quant_out, torch::Tensor scales) {
+    void* stream = (void*)at::cuda::getCurrentCUDAStream().stream();
+    bench_launch(
+        gate.data_ptr(), up.data_ptr(),
+        quant_out.data_ptr(), scales.data_ptr(),
+        stream);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("run_kernel", &run_kernel);
+}
+"""
+
+    def _pybind_nvfp4_quantize(self) -> str:
+        return """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+extern "C" void bench_launch(void*, void*, void*, void*);
+
+void run_kernel(
+    torch::Tensor input,
+    torch::Tensor packed, torch::Tensor scales) {
+    void* stream = (void*)at::cuda::getCurrentCUDAStream().stream();
+    bench_launch(
+        input.data_ptr(),
+        packed.data_ptr(), scales.data_ptr(),
+        stream);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("run_kernel", &run_kernel);
+}
+"""
+
+    # ── Tensor creation for L2-cycling inputs ────────────────────────────────
+
+    def _create_inputs(self, shape: tuple):
+        """Create one set of input tensors on GPU (called per L2-cycle buffer)."""
+        import torch
+        if self.kernel_type == "add_rmsnorm":
+            rows, hidden = shape
+            return (
+                torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"),
+                torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"),
+                torch.ones(hidden, dtype=torch.bfloat16, device="cuda"),
+            )
+        elif self.kernel_type == "silu_mul":
+            b, m, k = shape
+            return (
+                torch.randn(b * m * k, dtype=torch.bfloat16, device="cuda"),
+                torch.randn(b * m * k, dtype=torch.bfloat16, device="cuda"),
+            )
+        elif self.kernel_type == "nvfp4_quantize":
+            m, k = shape
+            return (
+                torch.randn(m * k, dtype=torch.bfloat16, device="cuda"),
+            )
+
