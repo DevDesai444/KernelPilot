@@ -573,3 +573,56 @@ int main() {{
 }}
 """
 
+    def _harness_nvfp4_quantize(self, shape: tuple) -> str:
+        m, k = shape
+        n = m * k
+        nb = n // 16
+        input_bytes = n * 2
+        launch = f"launch_nvfp4_quantize_bf16(din[buf_idx],dpk,dsc,N,s);"
+        return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+{self._cuda_harness_prelude()}
+void launch_nvfp4_quantize_bf16(
+    const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
+int main() {{
+    const int N={n}, nb={nb};
+    {self._l2_cycling_preamble(input_bytes)}
+    __nv_bfloat16 **din = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    for (int b=0; b<nbufs; ++b) {{
+        cudaMalloc(&din[b],N*2);
+    }}
+    cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
+    cudaStream_t s; cudaStreamCreate(&s);
+    {self._timing_footer(launch, self.iters, self.warmup)}
+    for(int b=0;b<nbufs;++b) {{ cudaFree(din[b]); }}
+    free(din);
+    return 0;
+}}
+"""
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def benchmark(self, kernel_src: str, baseline_us_per_shape: dict) -> dict:
+        results  = {}
+        speedups = []
+        for shape, baseline in baseline_us_per_shape.items():
+            t_us = self._compile_and_time(kernel_src, shape)
+            if t_us is not None and baseline and baseline > 0:
+                speedup = baseline / t_us
+                speedups.append(speedup)
+                results[shape] = {"timing_us": t_us, "speedup": speedup, "baseline_us": baseline}
+                logger.info("Shape %s: %.2f us → %.3fx", shape, t_us, speedup)
+            else:
+                results[shape] = {"timing_us": None, "speedup": 0.0, "baseline_us": baseline}
+                logger.warning("Shape %s: benchmark failed", shape)
+        results["geomean_speedup"] = geometric_mean(speedups)
+        results["speedups"]        = speedups
+        logger.info("Geometric mean speedup: %.3fx", results["geomean_speedup"])
+        return results
