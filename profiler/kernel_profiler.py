@@ -130,3 +130,87 @@ class KernelProfiler:
 
     # ── Profiling ─────────────────────────────────────────────────────────────
 
+    def profile(
+        self,
+        binary_path: Path,
+        report_name: str = "profile",
+        kernel_regex: str = ".*",
+        kernel_src: str = "",
+        kernel_type: str = "",
+        problem_shape: tuple = (),
+        baseline_us: float = 0.0,
+        timing_us: float = 0.0,
+        compiler_metrics: 'CompilerMetrics' = None,
+    ) -> Optional[KernelMetrics]:
+        """Profile using hybrid profiler (timing + compiler metrics)."""
+        if not kernel_src or not kernel_type or not problem_shape or timing_us <= 0:
+            logger.warning("Profiler: insufficient info (type=%s shape=%s timing=%.1f)",
+                          kernel_type, problem_shape, timing_us)
+            return None
+        return self.hybrid.profile(
+            kernel_src=kernel_src,
+            timing_us=timing_us,
+            kernel_type=kernel_type,
+            problem_shape=problem_shape,
+            baseline_us=baseline_us,
+            compiler_metrics=compiler_metrics,
+        )
+
+    # ── Timing ────────────────────────────────────────────────────────────────
+
+    def benchmark_timing(
+        self, binary_path: Path, warmup: int = 500, iters: int = 100
+    ) -> Optional[float]:
+        """Run binary, parse 'timing_us: <float>' from stdout. Returns microseconds."""
+        if not binary_path.exists():
+            return None
+        try:
+            result = subprocess.run(
+                [str(binary_path), f"--warmup={warmup}", f"--iters={iters}"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Benchmark timed out after 120s: %s", binary_path)
+            return None
+        if result.returncode != 0:
+            logger.error("Benchmark failed: %s", result.stderr[:200])
+            return None
+
+        match = re.search(r"timing_us:\s*([\d.]+)", result.stdout)
+        if match:
+            return float(match.group(1))
+        matches = re.findall(r"(\d+\.\d+)\s*us", result.stdout)
+        return float(matches[-1]) if matches else None
+
+    # ── Convenience: compile + profile in one step ────────────────────────────
+
+    def compile_and_profile(
+        self,
+        kernel_src: str,
+        harness_src: str,
+        name: str,
+        baseline_us: float,
+        kernel_type: str = "",
+        problem_shape: tuple = (),
+    ) -> tuple:
+        """Returns (compile_ok, metrics_or_None, speedup)."""
+        ok, err, binary, cm = self.compile_kernel(kernel_src, harness_src, name)
+        if not ok:
+            return False, None, 0.0
+
+        timing_us = self.benchmark_timing(binary)
+        if timing_us is None:
+            return True, None, 0.0
+
+        speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
+        metrics = self.profile(
+            binary, report_name=name,
+            kernel_src=kernel_src, kernel_type=kernel_type,
+            problem_shape=problem_shape, baseline_us=baseline_us,
+            timing_us=timing_us, compiler_metrics=cm,
+        )
+        if metrics:
+            metrics.duration_us = timing_us
+            metrics.speedup = speedup
+
+        return True, metrics, speedup
