@@ -147,3 +147,47 @@ class HybridProfiler:
     # ── Transfer Bytes Estimation ─────────────────────────────────────────
 
     @staticmethod
+    def _estimate_transfer_bytes(kernel_type: str, problem_shape: tuple) -> int:
+        """Estimate total HBM bytes transferred (same math as get_roofline_feedback)."""
+        if kernel_type == "add_rmsnorm":
+            rows, hidden = problem_shape
+            n = rows * hidden
+            return n * 2 + n * 2 + hidden * 2 + n * 2 + n // 2 + n // 16 + n * 2
+        elif kernel_type == "silu_mul":
+            n = problem_shape[0] * problem_shape[1] * problem_shape[2] if len(problem_shape) == 3 else problem_shape[0]
+            return n * 2 * 2 + n // 2 + n // 16
+        elif kernel_type == "nvfp4_quantize":
+            n = problem_shape[0] * problem_shape[1] if len(problem_shape) == 2 else problem_shape[0]
+            return n * 2 + n // 2 + n // 16
+        return 0
+
+    # ── Launch Config Parsing ──────────────────────────────────────────────
+
+    def _parse_launch_config(self, kernel_src: str) -> tuple[int, int]:
+        """Extract block size and shared memory from kernel source."""
+        launch = re.search(
+            r'<<<\s*[^,]+,\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*\w+)?\s*>>>', kernel_src
+        )
+        if launch:
+            block_size = int(launch.group(1))
+            shared_mem = int(launch.group(2)) if launch.group(2) else 0
+            return block_size, shared_mem
+
+        dim3 = re.search(r'dim3\s+\w+\s*\(\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*(\d+))?\s*\)', kernel_src)
+        if dim3:
+            x = int(dim3.group(1))
+            y = int(dim3.group(2)) if dim3.group(2) else 1
+            z = int(dim3.group(3)) if dim3.group(3) else 1
+            return x * y * z, 0
+
+        block_def = re.search(
+            r'(?:#define\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|BLOCK_DIM)\s+(\d+))|'
+            r'(?:constexpr\s+int\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|kBlockSize)\s*=\s*(\d+))',
+            kernel_src
+        )
+        block_size = int(block_def.group(1) or block_def.group(2)) if block_def else 256
+        shared_mem = _estimate_shared_memory(kernel_src)
+        return block_size, shared_mem
+
+    # ── Occupancy ──────────────────────────────────────────────────────────
+
