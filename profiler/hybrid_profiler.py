@@ -191,3 +191,85 @@ class HybridProfiler:
 
     # ── Occupancy ──────────────────────────────────────────────────────────
 
+    def _query_occupancy_from_binary(
+        self, kernel_src: str, block_size: int, shared_mem: int
+    ) -> Optional[float]:
+        """Query real occupancy via CUDA API (accounts for register pressure)."""
+        global_funcs = re.findall(r'__global__\s+void\s+(\w+)\s*\(', kernel_src)
+        if not global_funcs:
+            return None
+
+        kernel_name = global_funcs[0]
+        query_src = f"""
+{kernel_src}
+
+#include <cstdio>
+#include <cuda_runtime.h>
+
+int main() {{
+    int num_blocks = 0;
+    int block_size = {block_size};
+    size_t shared_mem = {shared_mem};
+
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, {kernel_name}, block_size, shared_mem);
+
+    if (err != cudaSuccess) {{
+        printf("occ_error\\n");
+        return 1;
+    }}
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int warps_per_block = (block_size + prop.warpSize - 1) / prop.warpSize;
+    int active_warps = num_blocks * warps_per_block;
+    int max_warps = prop.maxThreadsPerMultiProcessor / prop.warpSize;
+    float occupancy = (float)active_warps / (float)max_warps * 100.0f;
+
+    printf("occ_pct: %.2f\\n", occupancy);
+    printf("active_blocks: %d\\n", num_blocks);
+    return 0;
+}}
+"""
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src_path = Path(tmpdir) / "occupancy_query.cu"
+                bin_path = Path(tmpdir) / "occupancy_query"
+                src_path.write_text(query_src)
+                comp = subprocess.run(
+                    [self.nvcc] + self.nvcc_flags + [str(src_path), "-o", str(bin_path)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if comp.returncode != 0:
+                    logger.debug("Occupancy query compilation failed: %s", comp.stderr[:200])
+                    return None
+                run = subprocess.run([str(bin_path)], capture_output=True, text=True, timeout=10)
+                if run.returncode != 0:
+                    return None
+                match = re.search(r"occ_pct:\s*([\d.]+)", run.stdout)
+                if match:
+                    occ = float(match.group(1))
+                    logger.info("CUDA Occupancy API: %.1f%%", occ)
+                    return occ
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("Occupancy query failed: %s", e)
+        return None
+
+    def _compute_theoretical_occupancy(
+        self, block_size: int, shared_mem: int, registers_per_thread: int = 0
+    ) -> float:
+        warps_per_block = math.ceil(block_size / self.warp_size)
+        max_by_warps = self.max_warps_per_sm // warps_per_block if warps_per_block > 0 else 0
+        max_by_smem = int(self.shared_mem_per_sm / shared_mem) if shared_mem > 0 else self.max_blocks_per_sm
+
+        # Register-based occupancy limit (B200: 65536 registers per SM)
+        regs_per_sm = 65536
+        if registers_per_thread > 0:
+            regs_per_block = registers_per_thread * block_size
+            max_by_regs = regs_per_sm // regs_per_block if regs_per_block > 0 else self.max_blocks_per_sm
+        else:
+            max_by_regs = self.max_blocks_per_sm
+
+        active_blocks = min(max_by_warps, max_by_smem, max_by_regs, self.max_blocks_per_sm)
+        active_warps = active_blocks * warps_per_block
+        return min(100.0, max(0.0, active_warps / self.max_warps_per_sm * 100.0))
