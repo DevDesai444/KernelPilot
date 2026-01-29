@@ -223,3 +223,62 @@ int main() {
         print(stdout)
 
 
+def test_device_info():
+    """
+    Test 4: Get actual device specs to verify hybrid profiler constants.
+    """
+    print("=" * 60)
+    print("TEST 4: Device specs vs hybrid profiler constants")
+    print("=" * 60)
+
+    src = """
+#include <cstdio>
+#include <cuda_runtime.h>
+
+int main() {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+
+    printf("device_name: %s\\n", prop.name);
+    printf("compute_capability: %d.%d\\n", prop.major, prop.minor);
+    printf("sm_count: %d\\n", prop.multiProcessorCount);
+    printf("max_threads_per_sm: %d\\n", prop.maxThreadsPerMultiProcessor);
+    printf("max_warps_per_sm: %d\\n", prop.maxThreadsPerMultiProcessor / prop.warpSize);
+    printf("max_blocks_per_sm: %d\\n", prop.maxBlocksPerMultiProcessor);
+    printf("warp_size: %d\\n", prop.warpSize);
+    printf("shared_mem_per_sm_kb: %zu\\n", prop.sharedMemPerMultiprocessor / 1024);
+    printf("shared_mem_per_block_kb: %zu\\n", prop.sharedMemPerBlock / 1024);
+    printf("l2_cache_mb: %d\\n", prop.l2CacheSize / (1024*1024));
+    printf("mem_clock_mhz: %d\\n", prop.memoryClockRate / 1000);
+    printf("mem_bus_width_bits: %d\\n", prop.memoryBusWidth);
+
+    double peak_bw_gbps = 2.0 * prop.memoryClockRate * 1e3 * prop.memoryBusWidth / 8.0 / 1e9;
+    printf("theoretical_peak_bw_gbps: %.2f\\n", peak_bw_gbps);
+    printf("achievable_peak_bw_gbps_75: %.2f\\n", peak_bw_gbps * 0.75);
+
+    printf("\\nCompare these with config/b200_spec.yaml values\\n");
+    return 0;
+}
+"""
+    stdout, _ = compile_and_run(src, "device_info")
+    if stdout:
+        print(stdout)
+
+
+if __name__ == "__main__":
+    print("HYBRID PROFILER VALIDATION SUITE")
+    print("Run this on the GPU server to verify metrics are real.\n")
+
+    test_device_info()
+    print()
+    test_bandwidth_validation()
+    print()
+    test_occupancy_validation()
+
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print("If Test 1 shows >100 GB/s → bandwidth measurement is real")
+    print("If Test 2 shows varying occupancy → occupancy API is real")
+    print("If Test 3 matches b200_spec.yaml → constants are correct")
+    print("=" * 60)
