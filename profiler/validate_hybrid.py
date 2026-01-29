@@ -157,3 +157,69 @@ int main() {{
     print()
 
 
+def test_occupancy_validation():
+    """
+    Test 2: Compare CUDA Occupancy API vs known block sizes.
+    Verifies the occupancy query is returning real GPU data.
+    """
+    print("=" * 60)
+    print("TEST 2: Occupancy API Validation")
+    print("=" * 60)
+
+    src = """
+#include <cstdio>
+#include <cuda_runtime.h>
+
+__global__ void kernel_32() { }
+__global__ void kernel_64() { }
+__global__ void kernel_128() { }
+__global__ void kernel_256() { }
+__global__ void kernel_512() { }
+__global__ void kernel_1024() { }
+
+// Kernel with lots of shared memory (should reduce occupancy)
+__global__ void kernel_smem() {
+    __shared__ float smem[16384]; // 64 KB shared memory
+    smem[threadIdx.x] = threadIdx.x;
+    __syncthreads();
+}
+
+int main() {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int max_warps = prop.maxThreadsPerMultiProcessor / prop.warpSize;
+    printf("Device: %s\\n", prop.name);
+    printf("Max threads/SM: %d\\n", prop.maxThreadsPerMultiProcessor);
+    printf("Max warps/SM: %d\\n", max_warps);
+    printf("Max blocks/SM: %d\\n", prop.maxBlocksPerMultiProcessor);
+    printf("Shared mem/SM: %zu KB\\n", prop.sharedMemPerMultiprocessor / 1024);
+    printf("SM count: %d\\n", prop.multiProcessorCount);
+    printf("\\n");
+
+    auto check = [&](const char* name, auto kernel, int block_size, size_t smem = 0) {
+        int num_blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks, kernel, block_size, smem);
+        int warps = num_blocks * (block_size / prop.warpSize);
+        float occ = (float)warps / max_warps * 100.0f;
+        printf("%-20s block=%4d smem=%5zuB → blocks/SM=%2d warps=%2d occ=%.1f%%\\n",
+               name, block_size, smem, num_blocks, warps, occ);
+    };
+
+    check("kernel_32",   kernel_32,   32);
+    check("kernel_64",   kernel_64,   64);
+    check("kernel_128",  kernel_128,  128);
+    check("kernel_256",  kernel_256,  256);
+    check("kernel_512",  kernel_512,  512);
+    check("kernel_1024", kernel_1024, 1024);
+    check("kernel_smem", kernel_smem, 256, 65536);
+
+    printf("\\nIf occupancy varies with block size and smem → API is returning REAL data\\n");
+    printf("If all show 100%% → API may be broken or returning defaults\\n");
+    return 0;
+}
+"""
+    stdout, _ = compile_and_run(src, "occ_test")
+    if stdout:
+        print(stdout)
+
+
