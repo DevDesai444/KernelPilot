@@ -218,3 +218,60 @@ KERNEL_IDEAL_STRATEGIES: dict = {
 }
 
 
+def select_for_kernel(
+    kernel_type: str,
+    tried: list,
+    beam_width: int = 4,
+) -> list:
+    """Select the best strategies for a specific kernel type.
+
+    Uses the kernel-ideal mapping first, then falls back to scoring
+    all applicable strategies from the bank.
+    """
+    # Start with ideal strategies for this kernel type
+    ideal = KERNEL_IDEAL_STRATEGIES.get(kernel_type, [])
+    selected = [s for s in ideal if s not in tried]
+
+    # If we need more, score remaining applicable strategies
+    if len(selected) < beam_width:
+        remaining = []
+        for name, s in STRATEGY_BANK.items():
+            if name in selected or name in tried:
+                continue
+            if not s.applies_to_kernel(kernel_type):
+                continue
+            remaining.append((s.priority, name))
+        remaining.sort(key=lambda x: -x[0])
+        for _, name in remaining:
+            if len(selected) >= beam_width:
+                break
+            selected.append(name)
+
+    return selected[:beam_width]
+
+
+def select_strategies(
+    bottleneck: str,
+    missing_opts: list,
+    tried: list,
+    beam_width: int = 4,
+) -> list:
+    """Legacy scorer: rank by bottleneck match + priority."""
+    candidates = []
+    for name, s in STRATEGY_BANK.items():
+        if name in tried:
+            continue
+        if name not in missing_opts and missing_opts:
+            continue
+        score = s.priority
+        if s.applies_to(bottleneck):
+            score += 5
+        candidates.append((score, name))
+    candidates.sort(key=lambda x: -x[0])
+    return [name for _, name in candidates[:beam_width]]
+
+
+def get_strategy(name: str) -> Strategy:
+    if name not in STRATEGY_BANK:
+        raise ValueError(f"Unknown strategy: {name}")
+    return STRATEGY_BANK[name]
