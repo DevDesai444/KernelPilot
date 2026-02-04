@@ -61,3 +61,81 @@ class BeamSearch:
         self._env_lock = threading.Lock()  # guards shared env counters
 
     @staticmethod
+    def _branch_family(candidate: KernelCandidate) -> str:
+        return (
+            candidate.branch_family
+            or candidate.parent_strategy
+            or candidate.strategy.split("__", 1)[0]
+        )
+
+    @staticmethod
+    def _recent_bad_outcomes(candidate: KernelCandidate, limit: int) -> int:
+        recent = list(candidate.refinement_history[-limit:])
+        return sum(entry.get("outcome") in {"stagnant", "regression"} for entry in recent)
+
+    def _is_plateaued(self, candidate: KernelCandidate) -> bool:
+        if candidate.refine_attempts >= self.plateau_refine_attempts:
+            return True
+        return self._recent_bad_outcomes(candidate, self.plateau_bad_rounds) >= self.plateau_bad_rounds
+
+    @staticmethod
+    def _cuda_harness_prelude() -> str:
+        return r"""
+#define CHECK_CUDA(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        return 2; \
+    } \
+} while (0)
+#define cudaMalloc(...) CHECK_CUDA(cudaMalloc(__VA_ARGS__))
+#define cudaMemcpy(...) CHECK_CUDA(cudaMemcpy(__VA_ARGS__))
+#define cudaMemset(...) CHECK_CUDA(cudaMemset(__VA_ARGS__))
+#define cudaFree(...) CHECK_CUDA(cudaFree(__VA_ARGS__))
+#define cudaStreamCreate(...) CHECK_CUDA(cudaStreamCreate(__VA_ARGS__))
+#define cudaStreamSynchronize(...) CHECK_CUDA(cudaStreamSynchronize(__VA_ARGS__))
+#define cudaEventCreate(...) CHECK_CUDA(cudaEventCreate(__VA_ARGS__))
+#define cudaEventRecord(...) CHECK_CUDA(cudaEventRecord(__VA_ARGS__))
+#define cudaEventElapsedTime(...) CHECK_CUDA(cudaEventElapsedTime(__VA_ARGS__))
+#define cudaEventDestroy(...) CHECK_CUDA(cudaEventDestroy(__VA_ARGS__))
+#define cudaDeviceGetAttribute(...) CHECK_CUDA(cudaDeviceGetAttribute(__VA_ARGS__))
+"""
+
+    def _prune_stale_families(self, survivors: list[KernelCandidate]) -> list[KernelCandidate]:
+        if len(survivors) <= 1:
+            return survivors
+
+        best = max(survivors, key=lambda c: c.speedup)
+        best_family = self._branch_family(best)
+        pruned = []
+
+        for candidate in survivors:
+            if candidate is best:
+                pruned.append(candidate)
+                continue
+
+            family = self._branch_family(candidate)
+            materially_behind = (
+                candidate.speedup < best.speedup * self.family_retire_ratio
+                or (best.speedup - candidate.speedup) > self.family_retire_gap
+            )
+            if (
+                family != best_family
+                and materially_behind
+                and self._is_plateaued(candidate)
+            ):
+                logger.info(
+                    "Pruning stale family [%s]: best=%s %.3fx candidate=%.3fx attempts=%d",
+                    family,
+                    best_family,
+                    best.speedup,
+                    candidate.speedup,
+                    candidate.refine_attempts,
+                )
+                continue
+
+            pruned.append(candidate)
+
+        pruned.sort(key=lambda c: -c.speedup)
+        return pruned[:self.beam_w]
+
