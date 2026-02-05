@@ -139,3 +139,51 @@ class BeamSearch:
         pruned.sort(key=lambda c: -c.speedup)
         return pruned[:self.beam_w]
 
+    def _family_distinct_top_pair(self, candidates: list[KernelCandidate]) -> tuple[KernelCandidate, KernelCandidate] | None:
+        ranked = [candidate for candidate in sorted(candidates, key=lambda c: -c.speedup) if candidate.is_viable()]
+        if len(ranked) < 2:
+            return None
+        first = ranked[0]
+        first_family = self._branch_family(first)
+        for other in ranked[1:]:
+            if self._branch_family(other) != first_family:
+                return first, other
+        return None
+
+    def _spawn_crossover_candidate(
+        self,
+        survivors: list[KernelCandidate],
+        round_num: int,
+        problem_shape: tuple,
+        baseline_us: float,
+    ) -> tuple[KernelCandidate, KernelMetrics] | None:
+        if not self.population_crossover or len(survivors) < 2 or self.env.over_budget():
+            return None
+        pair = self._family_distinct_top_pair(survivors)
+        if pair is None:
+            return None
+        logger.info(
+            "Injecting crossover candidate from families %s + %s",
+            self._branch_family(pair[0]),
+            self._branch_family(pair[1]),
+        )
+        try:
+            merged = self.engine.combine(list(pair))
+        except Exception as exc:
+            logger.warning("Crossover combine failed: %s", exc)
+            return None
+        merged.round_num = round_num
+        metrics = self._profile_candidate(merged, problem_shape, baseline_us)
+        return merged, metrics or KernelMetrics()
+
+    def _build_harness(self, problem_shape: tuple) -> str:
+        kt = self.env.kernel_type
+        if kt == "add_rmsnorm":
+            return self._harness_add_rmsnorm(problem_shape)
+        elif kt == "silu_mul":
+            return self._harness_silu_mul(problem_shape)
+        elif kt == "nvfp4_quantize":
+            return self._harness_nvfp4_quantize(problem_shape)
+        else:
+            raise ValueError(f"Unknown kernel_type: {kt}")
+
