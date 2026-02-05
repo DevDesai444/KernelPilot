@@ -187,3 +187,54 @@ class BeamSearch:
         else:
             raise ValueError(f"Unknown kernel_type: {kt}")
 
+    def _harness_add_rmsnorm(self, shape: tuple) -> str:
+        rows, hidden = shape
+        n, nb = rows * hidden, rows * hidden // 16
+        input_bytes = n * 2 * 2 + hidden * 2  # (input+residual)*bf16 + weight
+        return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdio.h>
+#include <stdlib.h>
+{self._cuda_harness_prelude()}
+void launch_fused_add_rmsnorm_nvfp4(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
+int main(int argc, char** argv) {{
+    int warmup=500, iters=100;
+    for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
+    const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
+    // Dynamic L2 cache cycling (KernelArena/ThunderKittens 2.0 methodology)
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **di = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **dr = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 *dw, *dro; unsigned char *dq; __nv_fp8_storage_t *ds;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&di[b],N*2); cudaMalloc(&dr[b],N*2); }}
+    cudaMalloc(&dw,hidden*2);
+    cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
+    cudaStream_t s; cudaStreamCreate(&s);
+    // Warmup with L2 cycling
+    for(int i=0;i<warmup;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
+    cudaStreamSynchronize(s);
+    // Timed reps — 2 CUDA events wrapping all reps (ThunderKittens convention)
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0,s);
+    for(int i=0;i<iters;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
+    cudaEventRecord(t1,s); cudaStreamSynchronize(s);
+    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+    printf("timing_us: %.3f\\n", ms*1000.f/iters);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(di[b]); cudaFree(dr[b]); }}
+    free(di); free(dr);
+    cudaFree(dw); cudaFree(dro); cudaFree(dq); cudaFree(ds);
+    return 0;
+}}
+"""
+
