@@ -238,3 +238,53 @@ int main(int argc, char** argv) {{
 }}
 """
 
+    def _harness_silu_mul(self, shape: tuple) -> str:
+        b, m, k = shape
+        n = b * m * k
+        nb = n // 16
+        input_bytes = n * 2 * 2  # (gate + up) * bf16
+        return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+{self._cuda_harness_prelude()}
+void launch_silu_mul_fp4quant(
+    const __nv_bfloat16*, const __nv_bfloat16*,
+    uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
+int main(int argc, char** argv) {{
+    int warmup=500, iters=100;
+    for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
+    const int N={n}, nb={nb};
+    // Dynamic L2 cache cycling
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **dg = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **du = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dq; __nv_fp8_storage_t *ds;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&dg[b],N*2); cudaMalloc(&du[b],N*2); }}
+    cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
+    cudaStream_t s; cudaStreamCreate(&s);
+    for(int i=0;i<warmup;++i) launch_silu_mul_fp4quant(dg[i%nbufs],du[i%nbufs],dq,ds,N,s);
+    cudaStreamSynchronize(s);
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0,s);
+    for(int i=0;i<iters;++i) launch_silu_mul_fp4quant(dg[i%nbufs],du[i%nbufs],dq,ds,N,s);
+    cudaEventRecord(t1,s); cudaStreamSynchronize(s);
+    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+    printf("timing_us: %.3f\\n", ms*1000.f/iters);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(dg[b]); cudaFree(du[b]); }}
+    free(dg); free(du);
+    cudaFree(dq); cudaFree(ds);
+    return 0;
+}}
+"""
+
