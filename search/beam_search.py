@@ -288,3 +288,95 @@ int main(int argc, char** argv) {{
 }}
 """
 
+    def _harness_nvfp4_quantize(self, shape: tuple) -> str:
+        m, k = shape
+        n = m * k
+        nb = n // 16
+        input_bytes = n * 2  # input * bf16
+        return f"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+{self._cuda_harness_prelude()}
+void launch_nvfp4_quantize_bf16(
+    const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
+int main(int argc, char** argv) {{
+    int warmup=500, iters=100;
+    for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
+    const int N={n}, nb={nb};
+    // Dynamic L2 cache cycling
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **din = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&din[b],N*2); }}
+    cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
+    cudaStream_t s; cudaStreamCreate(&s);
+    for(int i=0;i<warmup;++i) launch_nvfp4_quantize_bf16(din[i%nbufs],dpk,dsc,N,s);
+    cudaStreamSynchronize(s);
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0,s);
+    for(int i=0;i<iters;++i) launch_nvfp4_quantize_bf16(din[i%nbufs],dpk,dsc,N,s);
+    cudaEventRecord(t1,s); cudaStreamSynchronize(s);
+    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+    printf("timing_us: %.3f\\n", ms*1000.f/iters);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(din[b]); }}
+    free(din);
+    cudaFree(dpk); cudaFree(dsc);
+    return 0;
+}}
+"""
+
+    def measure_search_baseline(self, problem_shape: tuple) -> tuple[Optional[float], Optional[CompilerMetrics]]:
+        """Measure reference kernel timing with the SAME harness used for candidates.
+
+        Ensures symmetric measurement: both baseline and candidate see the same
+        L2 cache cycling, same CUDA event timing, same C++ dispatch overhead.
+        """
+        harness = self._build_harness(problem_shape)
+        safe_name = f"baseline_{self.env.kernel_type}_{int(time.time())}"
+        ok, err, binary, baseline_cm = self.profiler.compile_kernel(
+            kernel_src=self.env.kernel_src_raw, harness_src=harness,
+            output_name=safe_name,
+        )
+        if not ok:
+            logger.warning("Baseline compilation failed: %s", err[:200])
+            return None, None
+        timing = self._benchmark_with_graphs(self.env.kernel_src_raw, problem_shape)
+        if timing is None:
+            logger.warning("Graph benchmark baseline failed; falling back to binary event timing")
+            timing = self.profiler.benchmark_timing(binary)
+        if timing:
+            logger.info("Search baseline (with L2 cycling): %.3f us", timing)
+        self.env.baseline_naive_us = timing
+        self.env.baseline_compiler_metrics = baseline_cm
+        return timing, baseline_cm
+
+    def _benchmark_with_graphs(self, kernel_src: str, problem_shape: tuple) -> Optional[float]:
+        try:
+            return self.benchmarker._compile_and_time(kernel_src, problem_shape)
+        except Exception as exc:
+            logger.warning("Graph benchmark failed for %s: %s", self.env.kernel_type, exc)
+            return None
+
+    @staticmethod
+    def _timing_delta_pct(graph_timing_us: Optional[float], binary_timing_us: Optional[float]) -> Optional[float]:
+        if graph_timing_us is None or binary_timing_us is None or binary_timing_us <= 0:
+            return None
+        return ((graph_timing_us - binary_timing_us) / binary_timing_us) * 100.0
+
+    @staticmethod
+    def _speedup_from_timing(baseline_us: float, timing_us: Optional[float]) -> float:
+        if timing_us is None or timing_us <= 0 or baseline_us <= 0:
+            return 0.0
+        return baseline_us / timing_us
+
