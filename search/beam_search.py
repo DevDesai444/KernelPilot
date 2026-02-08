@@ -559,3 +559,60 @@ int main(int argc, char** argv) {{
             )
         return metrics
 
+    def _make_inner_profile_fn(self, problem_shape, baseline_us):
+        """Create a profiling callback for the engine's inner refinement loop."""
+        def fn(code, strategy, round_num):
+            temp = KernelCandidate(
+                code=code,
+                strategy=f"{strategy}_inner",
+                round_num=round_num,
+                compile_ok=bool(code),
+            )
+            self._profile_candidate(temp, problem_shape, baseline_us)
+            error = temp.compile_error
+            if not error and not temp.compile_ok:
+                error = "Rejected: code did not pass validation checks"
+            if not error and not temp.correct:
+                error = "Correctness failure: output mismatch"
+            return {
+                "compile_ok": temp.compile_ok,
+                "correct": temp.correct,
+                "speedup": temp.speedup,
+                "binary_speedup": (temp.metrics or {}).get("binary_speedup"),
+                "metrics": temp.metrics,
+                "branch_family": temp.bottleneck,
+                "error": error,
+            }
+        return fn
+
+    def _profile_candidates_parallel(
+        self,
+        candidates: list,
+        problem_shape: tuple,
+        baseline_us: float,
+    ) -> list:
+        """Profile all candidates in parallel using a thread pool.
+        Returns list of (candidate, KernelMetrics) tuples preserving input order."""
+        if not candidates:
+            return []
+
+        results = [None] * len(candidates)
+
+        max_workers = max(1, min(len(candidates), self.max_profile_workers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {
+                pool.submit(self._profile_candidate, c, problem_shape, baseline_us): i
+                for i, c in enumerate(candidates)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    m = future.result()
+                except Exception as e:
+                    logger.error("Profiling thread failed for [%s]: %s",
+                                 candidates[idx].strategy, e)
+                    m = None
+                results[idx] = (candidates[idx], m or KernelMetrics())
+
+        return results
+
