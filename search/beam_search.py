@@ -380,3 +380,182 @@ int main(int argc, char** argv) {{
             return 0.0
         return baseline_us / timing_us
 
+    def _profile_candidate(
+        self,
+        candidate: KernelCandidate,
+        problem_shape: tuple,
+        baseline_us: float,
+    ) -> Optional[KernelMetrics]:
+        clean, hack_type = is_clean(candidate.code)
+        if not clean:
+            logger.warning("Hack detected in candidate [%s]: %s — rejecting",
+                           candidate.strategy, hack_type)
+            candidate.compile_ok = False
+            candidate.speedup    = 0.0
+            candidate.bottleneck = "unknown"
+            with self._env_lock:
+                self.env.hack_rejections.append(
+                    {"strategy": candidate.strategy, "hack_type": hack_type,
+                     "round": candidate.round_num}
+                )
+            return None
+
+        harness = self._build_harness(problem_shape)
+        # Sanitize strategy name for filesystem (freeform names may have spaces/slashes)
+        safe_strat = re.sub(r'[^a-zA-Z0-9_-]', '_', candidate.strategy)
+        name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}_{id(candidate)}"
+
+        # Compile, check correctness, profile.
+        # Note: counters reflect ALL attempts including inner refinement retries.
+        ok = False
+        metrics = None
+        speedup = 0.0
+        binary_speedup = None  # set inside timing block; used for routing at end
+        with self._env_lock:
+            self.env.total_attempts += 1
+
+        compile_ok, err_msg, binary, compiler_metrics = self.profiler.compile_kernel(
+            kernel_src=candidate.code, harness_src=harness, output_name=name,
+        )
+        if not compile_ok:
+            candidate.compile_ok = False
+            candidate.compile_error = err_msg[:800]
+            logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
+        if compile_ok:
+            candidate.compile_ok = True  # nvcc succeeded
+            with self._env_lock:
+                self.env.compile_passes += 1
+            passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
+                                                          kernel_type=self.env.kernel_type)
+            if not passed:
+                candidate.compile_error = f"Correctness: {msg[:600]}"
+                logger.warning("  Correctness FAIL [%s] (err=%.4f): %s",
+                               candidate.strategy, max_err, msg[:200])
+            else:
+                with self._env_lock:
+                    self.env.correctness_passes += 1
+                candidate.correct = True
+                graph_timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
+                binary_timing_us = self.profiler.benchmark_timing(binary)
+                timing_delta_pct = self._timing_delta_pct(graph_timing_us, binary_timing_us)
+                graph_speedup = self._speedup_from_timing(baseline_us, graph_timing_us)
+                binary_speedup = self._speedup_from_timing(baseline_us, binary_timing_us)
+
+                if graph_timing_us is not None or binary_timing_us is not None:
+                    graph_str = f"{graph_timing_us:.3f}" if graph_timing_us is not None else "n/a"
+                    binary_str = f"{binary_timing_us:.3f}" if binary_timing_us is not None else "n/a"
+                    delta_str = f"{timing_delta_pct:+.1f}%" if timing_delta_pct is not None else "n/a"
+                    logger.info(
+                        "  Timing AB [%s]: graph=%sus binary=%sus delta=%s",
+                        candidate.strategy,
+                        graph_str,
+                        binary_str,
+                        delta_str,
+                    )
+                    logger.info(
+                        "  Speedup check [%s]: baseline=%.3fus source=%s graph=%.3fx binary=%.3fx",
+                        candidate.strategy,
+                        baseline_us,
+                        self.env.baseline_source,
+                        graph_speedup,
+                        binary_speedup,
+                    )
+                    if timing_delta_pct is not None and abs(timing_delta_pct) >= 10.0:
+                        logger.warning(
+                            "  Timing-path mismatch [%s]: graph and binary differ by %.1f%%",
+                            candidate.strategy,
+                            timing_delta_pct,
+                        )
+
+                timing_us = graph_timing_us
+                timing_path = "graph"
+                # Fall back to binary if graph is None OR if mismatch is extreme
+                # (>100% delta indicates broken graph capture, e.g. L2 cycling issue on large shapes)
+                if timing_us is None:
+                    logger.warning(
+                        "Graph benchmark failed for [%s]; falling back to binary event timing",
+                        candidate.strategy,
+                    )
+                    timing_us = binary_timing_us
+                    timing_path = "binary_fallback"
+                elif timing_delta_pct is not None and abs(timing_delta_pct) > 100.0 and binary_timing_us is not None:
+                    logger.warning(
+                        "  Graph timing suspect for [%s] (delta=%.1f%%); using binary timing %.3fus instead",
+                        candidate.strategy, timing_delta_pct, binary_timing_us,
+                    )
+                    timing_us = binary_timing_us
+                    timing_path = "binary_fallback"
+                if timing_us is not None:
+                    speedup = self._speedup_from_timing(baseline_us, timing_us)
+                    metrics = self.profiler.profile(
+                        binary, report_name=name,
+                        kernel_src=candidate.code,
+                        kernel_type=self.env.kernel_type,
+                        problem_shape=problem_shape,
+                        baseline_us=baseline_us,
+                        timing_us=timing_us,
+                        compiler_metrics=compiler_metrics,
+                    )
+                    if metrics:
+                        metrics.duration_us = timing_us
+                        metrics.speedup = speedup
+                        metrics.graph_timing_us = graph_timing_us or 0.0
+                        metrics.binary_timing_us = binary_timing_us or 0.0
+                        metrics.timing_delta_pct = timing_delta_pct or 0.0
+                        metrics.graph_speedup = graph_speedup
+                        metrics.binary_speedup = binary_speedup
+                        logger.info("  Profiler: occ=%.1f%% timing=%.1fus speedup=%.3fx",
+                                    metrics.sm_occupancy, metrics.duration_us, metrics.speedup)
+                    else:
+                        logger.warning("  Profiler returned no metrics for [%s]", candidate.strategy)
+                    candidate.metrics = {
+                        "baseline_us": baseline_us,
+                        "baseline_source": self.env.baseline_source,
+                        "selected_timing_path": timing_path,
+                        "selected_timing_us": timing_us,
+                        "graph_timing_us": graph_timing_us,
+                        "binary_timing_us": binary_timing_us,
+                        "timing_delta_pct": timing_delta_pct,
+                        "graph_speedup": graph_speedup,
+                        "binary_speedup": binary_speedup,
+                    }
+                ok = True
+
+        # Runtime hack checks — run after compile confirms the kernel is valid CUDA
+        if ok:
+            rt_clean, rt_hack = run_runtime_checks(candidate.code, kernel_type=self.env.kernel_type)
+            if not rt_clean:
+                logger.warning("Runtime hack detected in candidate [%s]: %s — rejecting",
+                               candidate.strategy, rt_hack)
+                candidate.compile_ok = False
+                candidate.speedup    = 0.0
+                candidate.bottleneck = "rejected"
+                with self._env_lock:
+                    self.env.hack_rejections.append(
+                        {"strategy": candidate.strategy, "hack_type": f"runtime:{rt_hack}",
+                         "round": candidate.round_num}
+                    )
+                return None
+
+        # Always set speedup from timing, even if profiling failed
+        candidate.speedup = speedup
+        if metrics:
+            metrics_dict = metrics.to_dict()
+            metrics_dict.update(candidate.metrics)
+            candidate.metrics = metrics_dict
+            candidate.bottleneck = self._branch_family(candidate) or "unlabeled"
+        if candidate.compile_ok and candidate.correct:
+            # Use binary speedup for routing when available: graph timing is symmetric
+            # with the FlashInfer baseline but both are inflated ~3-8% by the stream-s
+            # pre-capture step, compressing ratios toward 1.0x. Binary timing is ground
+            # truth. A kernel is "above baseline" if either measure says so.
+            routing_speedup = max(speedup, binary_speedup if binary_speedup is not None else 0.0)
+            route = "planner_tree" if routing_speedup >= 1.0 else "fixer_with_rag"
+            candidate.feedback_route = route
+            logger.info(
+                "  route=%s graph=%.3fx binary=%s",
+                route, speedup,
+                f"{binary_speedup:.3f}x" if binary_speedup is not None else "n/a",
+            )
+        return metrics
+
