@@ -55,3 +55,44 @@ class KernelCandidate:
 
 
 @dataclass
+class OptimizationHistory:
+    """Tracks everything tried across all rounds and strategies."""
+    entries: list = field(default_factory=list)
+
+    def record(self, candidate: KernelCandidate, notes: str = "") -> None:
+        self.entries.append({
+            "timestamp": time.time(),
+            "strategy": candidate.strategy,
+            "round": candidate.round_num,
+            "speedup": candidate.speedup,
+            "family": candidate.bottleneck,
+            "compile_ok": candidate.compile_ok,
+            "correct": candidate.correct,
+            "notes": notes,
+        })
+
+    def best_speedup(self) -> float:
+        viable = [e["speedup"] for e in self.entries
+                  if e["compile_ok"] and e["correct"]]
+        return max(viable) if viable else 1.0
+
+    def strategies_tried(self) -> list:
+        return list({e["strategy"] for e in self.entries})
+
+    def to_summary_str(self) -> str:
+        lines = []
+        for e in self.entries:
+            lines.append(
+                f"  round={e['round']} strategy={e['strategy']} "
+                f"speedup={e['speedup']:.3f}x "
+                f"ok={e['compile_ok']} correct={e['correct']}"
+            )
+        return "\n".join(lines) if lines else "  (none)"
+
+
+class RLMEnvironment:
+    """
+    Shared state object for the RLM REPL.
+    Root LLM reads/writes this; sub-LLMs get slices of it.
+    """
+
