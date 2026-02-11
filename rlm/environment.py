@@ -183,3 +183,59 @@ class RLMEnvironment:
         hot_end = min(hot_start + 30, len(lines))
         return hot_start, hot_end
 
+    def get_hot_loop_src(self) -> str:
+        s, e = self.find_hot_loop()
+        lines = self.kernel_src.split("\n")
+        return "\n".join(lines[s:e])
+
+    def get_kernel_slice(self, start: int, end: int) -> str:
+        return self.kernel_src[start:end]
+
+    def _strip_comments(self, src: str) -> str:
+        src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+        src = re.sub(r"//.*", "", src)
+        return src
+
+    def _extract_int_constants(self, src: str) -> dict[str, int]:
+        constants: dict[str, int] = {}
+        for name, expr in re.findall(r"^\s*#define\s+([A-Za-z_]\w*)\s+([^\n]+)$", src, flags=re.M):
+            value = self._eval_int_expr(expr.strip(), constants)
+            if value is not None:
+                constants[name] = value
+        if "BLOCK_THREADS" in constants:
+            constants["blockDim.x"] = constants["BLOCK_THREADS"]
+        return constants
+
+    def _eval_int_expr(self, expr: str, constants: dict[str, int]) -> Optional[int]:
+        expr = expr.strip()
+        if not expr:
+            return None
+        for name, value in sorted(constants.items(), key=lambda item: -len(item[0])):
+            expr = expr.replace(name, str(value))
+        expr = re.sub(r"\b(static_cast|reinterpret_cast|const)\b", "", expr)
+        expr = re.sub(r"\((?:int|unsigned|size_t|long|short)\)", "", expr)
+        if re.search(r"[A-Za-z_]", expr):
+            return None
+        if not re.fullmatch(r"[0-9xXa-fA-F+\-*/%<>&|() \t]+", expr):
+            return None
+        try:
+            value = eval(expr, {"__builtins__": {}}, {})
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        return None
+
+    def _find_matching_delim(self, text: str, start: int, open_ch: str, close_ch: str) -> int:
+        depth = 0
+        for idx in range(start, len(text)):
+            if text[idx] == open_ch:
+                depth += 1
+            elif text[idx] == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return -1
+
