@@ -239,3 +239,56 @@ class RLMEnvironment:
                     return idx
         return -1
 
+    def _estimate_for_loop_iterations(self, header: str, constants: dict[str, int]) -> Optional[int]:
+        parts = [part.strip() for part in header.split(";")]
+        if len(parts) != 3:
+            return None
+        init, cond, update = parts
+        init_match = re.search(r"([A-Za-z_]\w*)\s*=\s*(.+)$", init)
+        if not init_match:
+            return None
+        var = init_match.group(1)
+        start = self._eval_int_expr(init_match.group(2), constants)
+        if start is None:
+            return None
+
+        if re.fullmatch(rf"{re.escape(var)}\s*>>=\s*1", update) or re.fullmatch(
+            rf"{re.escape(var)}\s*=\s*{re.escape(var)}\s*>>\s*1", update
+        ):
+            if re.search(rf"\b{re.escape(var)}\b\s*>\s*0", cond):
+                count = 0
+                value = start
+                while value > 0:
+                    count += 1
+                    value >>= 1
+                return count
+
+        if re.fullmatch(rf"{re.escape(var)}\s*/=\s*2", update) or re.fullmatch(
+            rf"{re.escape(var)}\s*=\s*{re.escape(var)}\s*/\s*2", update
+        ):
+            if re.search(rf"\b{re.escape(var)}\b\s*>\s*0", cond):
+                count = 0
+                value = start
+                while value > 0:
+                    count += 1
+                    value //= 2
+                return count
+
+        step = None
+        if re.fullmatch(rf"(?:\+\+{re.escape(var)}|{re.escape(var)}\+\+)", update):
+            step = 1
+        else:
+            step_match = re.fullmatch(rf"{re.escape(var)}\s*\+=\s*(.+)", update)
+            if step_match:
+                step = self._eval_int_expr(step_match.group(1), constants)
+        if step is not None and step > 0:
+            cond_match = re.search(rf"\b{re.escape(var)}\b\s*(<|<=)\s*(.+)$", cond)
+            if cond_match:
+                end = self._eval_int_expr(cond_match.group(2), constants)
+                if end is not None:
+                    if cond_match.group(1) == "<=":
+                        end += 1
+                    if start < end:
+                        return max(0, (end - start + step - 1) // step)
+        return None
+
