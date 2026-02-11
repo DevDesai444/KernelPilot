@@ -96,3 +96,90 @@ class RLMEnvironment:
     Root LLM reads/writes this; sub-LLMs get slices of it.
     """
 
+    def __init__(
+        self,
+        kernel_name: str,
+        kernel_src_path: str,
+        config_path: str = None,
+        kernel_type: str = "add_rmsnorm",
+        problem_shape: tuple = None,
+    ):
+        self.kernel_name = kernel_name
+        self.kernel_src_path = Path(kernel_src_path)
+        self.kernel_src_raw: str = self.kernel_src_path.read_text()
+        self.kernel_src: str = self._expand_local_includes(self.kernel_src_raw)
+        self.kernel_type: str = kernel_type
+
+        hw_spec_path = PROJECT_ROOT / "config" / "b200_spec.yaml"
+        with open(hw_spec_path) as f:
+            self.hw_spec: dict = yaml.safe_load(f)
+
+        search_cfg_path = config_path or PROJECT_ROOT / "config" / "search_config.yaml"
+        with open(search_cfg_path) as f:
+            self.search_config: dict = yaml.safe_load(f)
+
+        self.profile_report: Optional[dict] = None
+        self.baseline_us: Optional[float] = None
+        self.baseline_us_reported: Optional[float] = None
+        self.baseline_source: str = "unknown"
+        self.official_baseline: bool = False
+        self.baseline_naive_us: Optional[float] = None
+        self.baseline_compiler_metrics = None  # CompilerMetrics from reference kernel
+        self._pricing_warnings: set[str] = set()
+
+        # Task-specific shape takes priority over config shapes
+        if problem_shape is not None:
+            self.problem_shapes: list = [problem_shape]
+        else:
+            self.problem_shapes: list = [
+                tuple(s) for s in self.search_config["eval"]["problem_shapes"]
+            ]
+
+        self.optimization_history = OptimizationHistory()
+        self.current_round: int = 0
+        self.total_api_cost_usd: float = 0.0
+        self.candidates: list = []
+        self.hack_rejections: list = []
+        # Pass rate tracking (first-try, no retries)
+        self.total_attempts: int = 0
+        self.compile_passes: int = 0
+        self.correctness_passes: int = 0
+
+    # ── Preprocessing ──────────────────────────────────────────────────────────
+
+    def _expand_local_includes(self, src: str) -> str:
+        """Expand local #include directives so the LLM sees helper function signatures."""
+        lines = src.split("\n")
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#include "') and stripped.endswith('"'):
+                rel_path = stripped[len('#include "'):-1]
+                header = self.kernel_src_path.parent / rel_path
+                if header.exists():
+                    result.append(f"// === expanded from {rel_path} ===")
+                    result.append(header.read_text())
+                    result.append(f"// === end {rel_path} ===")
+                    continue
+            result.append(line)
+        return "\n".join(result)
+
+    # ── Kernel source navigation ──────────────────────────────────────────────
+
+    def find_kernel_function(self, pattern: str = r"__global__\s+void\s+(\w+)") -> list:
+        return re.findall(pattern, self.kernel_src)
+
+    def find_hot_loop(self) -> tuple:
+        lines = self.kernel_src.split("\n")
+        hot_start = 0
+        depth_max = 0
+        depth = 0
+        for i, line in enumerate(lines):
+            depth += line.count("{") - line.count("}")
+            if "for" in line and ("[" in line or "load" in line.lower()):
+                if depth > depth_max:
+                    depth_max = depth
+                    hot_start = i
+        hot_end = min(hot_start + 30, len(lines))
+        return hot_start, hot_end
+
