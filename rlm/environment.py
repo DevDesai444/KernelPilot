@@ -292,3 +292,48 @@ class RLMEnvironment:
                         return max(0, (end - start + step - 1) // step)
         return None
 
+    def _count_runtime_syncs(self, src: str, constants: dict[str, int]) -> int:
+        total = 0
+        cursor = 0
+        while cursor < len(src):
+            sync_idx = src.find("__syncthreads", cursor)
+            for_match = re.search(r"\bfor\s*\(", src[cursor:])
+            for_idx = cursor + for_match.start() if for_match else -1
+
+            if sync_idx == -1 and for_idx == -1:
+                break
+            if sync_idx != -1 and (for_idx == -1 or sync_idx < for_idx):
+                total += 1
+                cursor = sync_idx + len("__syncthreads")
+                continue
+
+            header_open = src.find("(", for_idx)
+            header_close = self._find_matching_delim(src, header_open, "(", ")")
+            if header_open == -1 or header_close == -1:
+                cursor = for_idx + 3
+                continue
+            header = src[header_open + 1:header_close]
+            body_start = header_close + 1
+            while body_start < len(src) and src[body_start].isspace():
+                body_start += 1
+
+            if body_start < len(src) and src[body_start] == "{":
+                body_end = self._find_matching_delim(src, body_start, "{", "}")
+                if body_end == -1:
+                    cursor = body_start + 1
+                    continue
+                body = src[body_start + 1:body_end]
+                cursor = body_end + 1
+            else:
+                stmt_end = src.find(";", body_start)
+                if stmt_end == -1:
+                    cursor = body_start + 1
+                    continue
+                body = src[body_start:stmt_end + 1]
+                cursor = stmt_end + 1
+
+            body_syncs = self._count_runtime_syncs(body, constants)
+            iterations = self._estimate_for_loop_iterations(header, constants)
+            total += body_syncs * max(iterations or 1, 1)
+        return total
+
