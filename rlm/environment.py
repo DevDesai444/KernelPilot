@@ -337,3 +337,59 @@ class RLMEnvironment:
             total += body_syncs * max(iterations or 1, 1)
         return total
 
+    def estimate_runtime_syncthreads(self) -> tuple[int, int]:
+        src = self._strip_comments(self.kernel_src_raw)
+        constants = self._extract_int_constants(src)
+        source_occurrences = src.count("__syncthreads")
+        runtime_estimate = self._count_runtime_syncs(src, constants)
+        return source_occurrences, max(runtime_estimate, source_occurrences)
+
+    def count_memory_ops(self) -> dict:
+        # Use raw source (without expanded includes) to analyze the actual kernel code
+        src = self._strip_comments(self.kernel_src_raw)
+        syncthreads_source, syncthreads_runtime = self.estimate_runtime_syncthreads()
+        return {
+            "loads":       len(re.findall(r"\b(?:__ldg|ld\.global|tex1Dfetch)\b", src)),
+            "stores":      len(re.findall(r"\b(?:__stg|st\.global|atomicAdd)\b", src)),
+            "float4":      src.count("float4"),
+            "cp_async":    src.count("cp.async"),
+            "tma":         src.count("tma_load") + src.count("tcgen05"),
+            "syncthreads": syncthreads_runtime,
+            "syncthreads_source": syncthreads_source,
+            "shfl":        src.count("__shfl"),
+        }
+
+    def detect_missing_optimizations(self) -> list:
+        """Kernel-type-aware optimization detection.
+
+        Uses kernel-specific ideal strategy selection instead of keyword grep.
+        Falls back to legacy grep-based detection for unknown kernel types.
+        """
+        from search.strategy_bank import select_for_kernel, KERNEL_IDEAL_STRATEGIES
+
+        tried = self.optimization_history.strategies_tried()
+
+        # Use kernel-aware selection if we know the kernel type
+        if self.kernel_type in KERNEL_IDEAL_STRATEGIES:
+            return select_for_kernel(
+                kernel_type=self.kernel_type,
+                tried=tried,
+                beam_width=self.search_config["beam"]["width"],
+            )
+
+        # Legacy fallback for unknown kernel types
+        ops = self.count_memory_ops()
+        enabled = self.search_config["strategies"]["enabled"]
+        missing = []
+        if ops["float4"] == 0 and "vectorize_loads" in enabled:
+            missing.append("vectorize_loads")
+        if ops["tma"] == 0 and "tma_prefetch" in enabled:
+            missing.append("tma_prefetch")
+        if ops["syncthreads"] > 2 and ops["shfl"] == 0 and "warp_reduction" in enabled:
+            missing.append("warp_reduction")
+        if "fuse_passes" in enabled and self.kernel_src.count("__global__") > 1:
+            missing.append("fuse_passes")
+        return missing
+
+    # ── Cost tracking ─────────────────────────────────────────────────────────
+
