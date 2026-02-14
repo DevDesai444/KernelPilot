@@ -393,3 +393,72 @@ class RLMEnvironment:
 
     # ── Cost tracking ─────────────────────────────────────────────────────────
 
+    def record_api_cost(self, tokens_in: int, tokens_out: int, model: str) -> float:
+        _costs_per_million = {
+            "claude-3-5-sonnet-20241022": {"in": 3.0,  "out": 15.0},
+            "claude-sonnet-4-6":         {"in": 3.0,  "out": 15.0},
+            "claude-opus-4-6":           {"in": 15.0, "out": 75.0},
+            "claude-haiku-4-6":          {"in": 0.25, "out": 1.25},
+            "claude-3-haiku-20240307":    {"in": 0.25, "out": 1.25},
+            "claude-haiku-4-5-20251001":  {"in": 0.25, "out": 1.25},
+            "claude-3-opus-20240229":     {"in": 15.0, "out": 75.0},
+        }
+        pricing_cfg = self.search_config.get("pricing", {})
+        configured = pricing_cfg.get(model)
+        if configured is not None:
+            p = configured
+        elif model in _costs_per_million:
+            p = _costs_per_million[model]
+        else:
+            default_pricing = pricing_cfg.get("default_model_pricing")
+            if default_pricing is not None:
+                p = default_pricing
+                if model not in self._pricing_warnings:
+                    logger.warning(
+                        "Using configured default pricing for unknown model '%s': in=%s out=%s",
+                        model, p.get("in"), p.get("out"),
+                    )
+                    self._pricing_warnings.add(model)
+            else:
+                p = {
+                    "in": max(item["in"] for item in _costs_per_million.values()),
+                    "out": max(item["out"] for item in _costs_per_million.values()),
+                }
+                if model not in self._pricing_warnings:
+                    logger.warning(
+                        "Unknown model '%s' has no configured pricing; using conservative fallback in=%s out=%s",
+                        model, p["in"], p["out"],
+                    )
+                    self._pricing_warnings.add(model)
+        cost = (tokens_in * p["in"] + tokens_out * p["out"]) / 1_000_000
+        self.total_api_cost_usd += cost
+        return cost
+
+    def budget_remaining(self) -> float:
+        return self.search_config["cost_control"]["max_total_api_cost_usd"] - self.total_api_cost_usd
+
+    def over_budget(self) -> bool:
+        return self.total_api_cost_usd >= self.search_config["cost_control"]["max_total_api_cost_usd"]
+
+    # ── State summary ─────────────────────────────────────────────────────────
+
+    def state_summary(self) -> str:
+        ops = self.count_memory_ops()
+        missing = self.detect_missing_optimizations()
+        return (
+            f"=== RLM Environment State ===\n"
+            f"Kernel:        {self.kernel_name}\n"
+            f"Source:        {self.kernel_src_path} ({len(self.kernel_src)} chars)\n"
+            f"Round:         {self.current_round}\n"
+            f"Candidates:    {len(self.candidates)}\n"
+            f"Best speedup:  {self.optimization_history.best_speedup():.3f}x\n"
+            f"API cost:      ${self.total_api_cost_usd:.4f} / "
+            f"${self.search_config['cost_control']['max_total_api_cost_usd']:.2f}\n"
+            f"Memory ops:    loads={ops['loads']} stores={ops['stores']} "
+            f"float4={ops['float4']} tma={ops['tma']}\n"
+            f"Sync ops:      syncthreads~={ops['syncthreads']} "
+            f"(src={ops['syncthreads_source']}) shfl={ops['shfl']}\n"
+            f"Missing opts:  {', '.join(missing) or 'none detected'}\n"
+            f"Strategies tried: {', '.join(self.optimization_history.strategies_tried()) or 'none'}\n"
+            f"History:\n{self.optimization_history.to_summary_str()}\n"
+        )
