@@ -109,3 +109,67 @@ CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and
 """
 
 
+def fuse_passes_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+            f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
+        )
+    return f"""\
+## Optimization Task: Fuse Multiple Memory Passes into One
+
+Hardware: NVIDIA B200 ({hw_spec['memory']['hbm_bandwidth_tbs']} TB/s HBM3e)
+{metrics_str}
+Full kernel source (complete .cu file, currently makes multiple passes over data):
+```cuda
+{kernel_slice}
+```
+
+Fuse separate read passes into a single loop:
+
+Requirements:
+1. Identify values computed in Pass 1 needed in Pass 2
+2. Use registers or shared memory to carry values across phases
+3. Single loop: load → compute all phases → store results
+4. Register budget: B200 has 255 registers/thread — use ~64
+5. Use `__ldg()` for read-only data (L1 texture cache)
+6. Mark read-only pointers with `__restrict__` and `const`
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
+def register_tiling_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
+        )
+    return f"""\
+## Optimization Task: Register-Level Tiling for Compute ILP
+
+Hardware: NVIDIA B200 (255 registers/thread, 4-wide SIMD fp32)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Apply register tiling to increase ILP:
+
+Requirements:
+1. Unroll inner loop by 4x — process 4 independent elements per iteration
+2. Use separate register variables (avoid array subscripts in hot path)
+3. Interleave independent computations to hide latency
+4. For RMSNorm: compute 4 partial sums simultaneously before reducing
+5. Preserve #pragma unroll for the compiler
+6. Do not exceed 96 registers/thread
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
