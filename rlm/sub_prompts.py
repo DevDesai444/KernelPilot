@@ -173,3 +173,84 @@ CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and
 """
 
 
+def async_pipeline_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Long scoreboard stalls: {current_metrics.get('stall_memory', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+        )
+    return f"""\
+## Optimization Task: Async Software Pipeline (cp.async)
+
+Hardware: NVIDIA B200 (Blackwell, cp.async.bulk supported)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Implement a software pipeline using cp.async:
+
+Requirements:
+1. Use `cuda::pipeline` from <cuda/pipeline>
+2. Pattern: issue cp.async for next tile → compute on current tile → commit + wait
+3. Pipeline depth = 2 (double buffer)
+4. Shared memory: allocate 2x tile_size for ping-pong
+5. Use `__pipeline_memcpy_async()` or TMA for bulk async copy
+6. Commit with `__pipeline_commit()`
+7. Wait with `__pipeline_wait_prior(1)` — allow 1 outstanding stage
+8. Handle prologue (first tile) and epilogue (drain) correctly
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
+def fp4_lut_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+        )
+    return f"""\
+## Optimization Task: FP4 Quantization Lookup Table
+
+Hardware: NVIDIA B200 (sm_100a)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Replace the arithmetic FP4 quantization with a precomputed lookup table:
+
+Background:
+NVFP4 has only 16 possible output values (4 bits). The current quantize_block_nvfp4()
+does per-element: find absmax → compute scale → clamp → round → bit-pack. This is
+expensive arithmetic for a function with only 16 possible outputs.
+
+Requirements:
+1. Precompute a __constant__ or __device__ lookup table that maps scaled float values
+   to their nearest FP4 encoding (4-bit code)
+2. The quantization per block becomes:
+   a. Find absmax of the 16-element block (keep this)
+   b. Compute E4M3 scale from absmax (keep this)
+   c. For each element: multiply by (1/scale), clamp to FP4 range,
+      use a LUT indexed by the quantized bin to get the 4-bit code
+3. Pack two 4-bit codes per byte as before
+4. The LUT approach eliminates the per-element float-to-fp4 conversion arithmetic
+5. Ensure the LUT covers both positive and negative values (sign bit handled separately)
+6. Keep the E4M3 scale computation identical to the original
+
+Hint: FP4 positive values are [0, 0.5, 1, 1.5, 2, 3, 4, 6]. You can build a
+boundary table [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] and use binary search or
+linear scan to find the nearest bin. With only 7 boundaries, a linear scan in
+registers is faster than any branching approach.
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
