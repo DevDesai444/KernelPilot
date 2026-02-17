@@ -336,3 +336,44 @@ CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and
 """
 
 
+def ldg_readonly_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+            f"  L2 hit rate: {current_metrics.get('l2_hit_rate', 'N/A')}%\n"
+            f"  DRAM stall rate: {current_metrics.get('stall_memory', 'N/A')}%\n"
+        )
+    return f"""\
+## Optimization Task: Read-Only Cache Routing (__ldg)
+
+Hardware: NVIDIA B200 (sm_100a, separate L1 texture cache path)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Route read-only memory accesses through the L1 texture cache:
+
+Background:
+The GPU has a separate read-only data cache (texture/L1 cache) that doesn't
+participate in coherence traffic. For data that is only read (never written),
+using __ldg() routes loads through this cache, freeing up the normal L1 for
+read-write data. Combined with __restrict__, the compiler can also reorder
+loads more aggressively.
+
+Requirements:
+1. Identify all input pointers that are read-only (never written to):
+   - input, residual, weight/rms_weight, gate, up — these are all read-only
+2. Mark them with `const __restrict__` if not already done
+3. Replace direct reads like `input[idx]` with `__ldg(&input[idx])`
+4. For bf16: `__ldg()` works with `__nv_bfloat16` directly
+5. Do NOT apply __ldg to output pointers (quant_out, residual_out, scales)
+6. Do NOT change any computation logic — only memory access routing
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
