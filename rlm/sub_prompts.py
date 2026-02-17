@@ -377,3 +377,66 @@ CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and
 """
 
 
+def vectorized_stores_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+        )
+    return f"""\
+## Optimization Task: Vectorized Stores for Packed Output
+
+Hardware: NVIDIA B200 (128-bit store transactions)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Replace byte-by-byte stores of packed FP4 output with vectorized writes:
+
+Background:
+The packed FP4 output is stored byte-by-byte in a loop:
+  for (j = 0; j < 8; ++j) quant_out[base + j] = packed_out[j];
+Each 1-byte store is a separate memory transaction. A single uint2 store (8 bytes)
+replaces all 8 stores with one 64-bit write. Similarly, scale stores can be batched.
+
+Requirements:
+1. Accumulate the 8 packed bytes into a uint2 (or two uint32_t values)
+2. Store with a single `*reinterpret_cast<uint2*>(&quant_out[base]) = packed_val;`
+3. Ensure the output pointer is 8-byte aligned (it should be, since quant blocks
+   are 8 bytes each and base addresses are cudaMalloc'd)
+4. Also vectorize loads where possible (input bf16 → load as uint4 for 8 bf16 values)
+5. Preserve all output semantics — packed byte order must be identical
+6. Keep the scale store as-is (single byte, not worth vectorizing alone)
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
+STRATEGY_PROMPTS = {
+    "vectorize_loads":   vectorize_loads_prompt,
+    "tma_prefetch":      tma_prefetch_prompt,
+    "warp_reduction":    warp_reduction_prompt,
+    "fuse_passes":       fuse_passes_prompt,
+    "register_tiling":   register_tiling_prompt,
+    "async_pipeline":    async_pipeline_prompt,
+    "fp4_lut":           fp4_lut_prompt,
+    "fast_math_expf":    fast_math_expf_prompt,
+    "thread_coarsening": thread_coarsening_prompt,
+    "ldg_readonly":      ldg_readonly_prompt,
+    "vectorized_stores": vectorized_stores_prompt,
+}
+
+
+def get_prompt_for_strategy(
+    strategy: str,
+    kernel_slice: str,
+    hw_spec: dict,
+    current_metrics: dict = None,
+) -> str:
+    if strategy not in STRATEGY_PROMPTS:
+        raise ValueError(f"Unknown strategy: {strategy}. Available: {list(STRATEGY_PROMPTS)}")
+    return STRATEGY_PROMPTS[strategy](kernel_slice, hw_spec, current_metrics)
