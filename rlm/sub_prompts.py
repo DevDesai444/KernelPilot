@@ -254,3 +254,85 @@ CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and
 """
 
 
+def fast_math_expf_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
+        )
+    return f"""\
+## Optimization Task: Fast Math Intrinsics for SiLU
+
+Hardware: NVIDIA B200 (sm_100a, SFU unit available)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Replace slow math library calls with hardware SFU intrinsics:
+
+Background:
+SiLU(x) = x / (1 + exp(-x)). The `expf()` call compiles to a multi-instruction
+software routine (~20 cycles). The hardware SFU can compute `__expf()` in ~4 cycles
+with slightly reduced precision. Since the output goes to FP4 (only 16 possible
+values), the precision difference is completely invisible.
+
+Requirements:
+1. Replace `expf(-g)` with `__expf(-g)` in the SiLU computation
+2. Replace `1.0f / (1.0f + ...)` with `__frcp_rn(1.0f + ...)` (hardware reciprocal)
+3. The optimized SiLU becomes: `x * __frcp_rn(1.0f + __expf(-x))`
+4. If rsqrtf is used anywhere, replace with `__frsqrt_rn()`
+5. Do NOT change any other logic — only math intrinsic substitutions
+6. Preserve all function signatures and launch wrappers
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
+def thread_coarsening_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = None) -> str:
+    sm_count = hw_spec["sm"]["count"]
+    metrics_str = ""
+    if current_metrics:
+        metrics_str = (
+            f"\nCurrent profiler metrics:\n"
+            f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+        )
+    return f"""\
+## Optimization Task: Thread Coarsening
+
+Hardware: NVIDIA B200 ({sm_count} SMs, 2048 threads/SM max)
+{metrics_str}
+Full kernel source (complete .cu file):
+```cuda
+{kernel_slice}
+```
+
+Increase the amount of work each thread performs:
+
+Background:
+Currently each thread processes very little data (e.g., 1 quantization block = 16
+elements, or a small slice of a row). Thread scheduling, register allocation, and
+warp launch overhead dominate. By having each thread process 4-8x more data, we
+amortize this overhead and improve instruction-level parallelism.
+
+Requirements:
+1. Identify the per-thread work unit (quantization block, row elements, etc.)
+2. Increase it by 4x:
+   - For quantize kernels: each thread processes 4 quant blocks (64 elements)
+   - For add_rmsnorm: each block processes 2-4 rows instead of 1
+   - Use a grid-stride loop if the total work exceeds grid capacity
+3. Adjust grid dimensions: divide grid size by the coarsening factor
+4. Use `#pragma unroll` on the coarsened inner loop
+5. Keep register usage under 96 per thread to maintain occupancy
+6. Handle the tail case: when total work isn't divisible by coarsening factor,
+   add a bounds check for the last iterations
+
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
+"""
+
+
