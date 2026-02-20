@@ -25,3 +25,89 @@ logger = logging.getLogger(__name__)
 
 # ── Reward computation ────────────────────────────────────────────────────────
 
+def compute_reward(compile_ok: bool, correct: bool, speedup: float) -> tuple[float, str]:
+    """Compute numerical reward score.
+    Returns (total_score, breakdown_string)."""
+    score = 0.0
+    parts = []
+
+    if compile_ok:
+        score += 20
+        parts.append("compile: +20")
+    else:
+        parts.append("compile: +0 (FAILED)")
+        return score, " | ".join(parts)
+
+    if correct:
+        score += 100
+        parts.append("correctness: +100")
+    else:
+        parts.append("correctness: +0 (FAILED)")
+        return score, " | ".join(parts)
+
+    perf_score = speedup * 100
+    score += perf_score
+    parts.append(f"speedup: +{perf_score:.0f} ({speedup:.3f}x)")
+
+    return score, " | ".join(parts)
+
+
+# ── Reflection templates ─────────────────────────────────────────────────────
+
+COMPILE_REFLECTION = dedent("""\
+    ## Iteration {iteration}
+
+    **Reward: {reward:.0f}** ({reward_breakdown})
+
+    ### Compiler error
+    ```
+    {error}
+    ```
+
+    ### Your previous solution
+    ```cuda
+    {solution}
+    ```
+
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
+""")
+
+
+CORRECTNESS_REFLECTION = dedent("""\
+    ## Iteration {iteration}
+
+    **Reward: {reward:.0f}** ({reward_breakdown})
+
+    ### Your previous solution
+    ```cuda
+    {solution}
+    ```
+
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
+""")
+
+
+PERFORMANCE_REFLECTION = dedent("""\
+    ## Iteration {iteration}
+
+    **Reward: {reward:.0f}** ({reward_breakdown})
+    {profile_section}
+    {suggestions_section}
+    {delta_section}
+    {stagnation_section}
+    {last_error_section}
+    {history_section}
+
+    ### Your previous solution (achieves {speedup:.3f}x)
+    ```cuda
+    {solution}
+    ```
+
+    Do NOT rewrite from scratch. Keep all working optimizations intact.
+    Apply ONE targeted change based on the optimization targets above.
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
+""")
+
+
+# ── Hardware context builder ─────────────────────────────────────────────────
+
