@@ -111,3 +111,77 @@ PERFORMANCE_REFLECTION = dedent("""\
 
 # ── Hardware context builder ─────────────────────────────────────────────────
 
+def _build_hw_context(hw_spec: dict) -> str:
+    mem = hw_spec.get("memory", {})
+    sm = hw_spec.get("sm", {})
+    name = hw_spec.get("hardware", {}).get("name", "GPU")
+    bw_tbs = mem.get("hbm_bandwidth_tbs", 8.0)
+    sm_count = sm.get("count", 142)
+    smem_kb = mem.get("shared_memory_per_sm_kb", 228)
+    max_threads = sm.get("max_threads_per_sm", 2048)
+    warp_size = sm.get("warp_size", 32)
+
+    return dedent(f"""\
+        ### {name} Hardware
+        - HBM bandwidth: {bw_tbs:.1f} TB/s
+        - {sm_count} SMs, {smem_kb} KB shared memory per SM, 255 registers per thread
+        - Warp size: {warp_size}, max {max_threads} threads per SM
+        - 128-bit load/store transactions (uint4 = 8 bf16 values)
+        - Fast math SFU: __expf ~4 cycles vs expf ~20 cycles
+        - Warp shuffle: __shfl_xor_sync ~2 cycles vs shared mem reduction ~10+ cycles
+    """)
+
+
+# ── Profile data formatter ───────────────────────────────────────────────────
+
+def _format_profile_section(metrics: dict, iteration: int) -> str:
+    """Format real runtime and compiler resource data only."""
+    if not metrics:
+        return ""
+
+    lines = [f"\n### Profiler Data (Iteration {iteration})"]
+    lines.append("```")
+
+    # Real runtime metrics
+    occupancy = metrics.get("sm_occupancy", 0)
+    duration = metrics.get("duration_us", 0)
+    speedup = metrics.get("speedup", 1.0)
+
+    lines.append(f"Kernel timing:                 {duration:.3f} us")
+    lines.append(f"Speedup vs FlashInfer:         {speedup:.3f}x")
+    lines.append(f"SM occupancy:                  {occupancy:.1f}%")
+
+    stall_mem = metrics.get("stall_memory", 0)
+    dram_bw = metrics.get("dram_read_bw_gbps", 0)
+    l2_hit = metrics.get("l2_hit_rate", 0)
+
+    if stall_mem > 0 or dram_bw > 0 or l2_hit > 0:
+        lines.append("")
+        if stall_mem > 0:
+            lines.append(f"Warp stalls (memory):          {stall_mem:.1f}%")
+        if dram_bw > 0:
+            lines.append(f"DRAM read bandwidth:           {dram_bw:.0f} GB/s")
+        if l2_hit > 0:
+            lines.append(f"L2 hit rate:                   {l2_hit:.1f}%")
+
+    # Compiler metrics (from nvcc -Xptxas -v)
+    cm = metrics.get("_compiler", {})
+    if cm:
+        regs = cm.get("registers_per_thread", 0)
+        spill_total = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
+        smem = cm.get("static_smem_bytes", 0)
+        stack = cm.get("stack_frame_bytes", 0)
+
+        lines.append("")
+        lines.append(f"Registers per thread:          {regs}")
+        lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
+        lines.append(f"Shared memory:                 {smem} bytes")
+        if stack > 0:
+            lines.append(f"Stack frame:                   {stack} bytes")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ── Last failed refinement error ──────────────────────────────────────────────
+
