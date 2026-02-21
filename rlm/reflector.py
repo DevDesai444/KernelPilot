@@ -339,3 +339,70 @@ def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int
 
 # ── Round-over-round delta ───────────────────────────────────────────────────
 
+def _format_delta_section(current: dict, previous: dict,
+                          title: str = "Changes vs Previous Round") -> str:
+    """Format round-over-round deltas using only real measured data."""
+    if not previous or not current:
+        return ""
+
+    lines = [f"\n### {title}"]
+    lines.append("```")
+
+    # Timing delta
+    cur_timing = current.get("duration_us", 0)
+    prev_timing = previous.get("duration_us", 0)
+    if cur_timing > 0 and prev_timing > 0:
+        delta_us = cur_timing - prev_timing
+        arrow = "v" if delta_us < 0 else "^" if delta_us > 0 else "="
+        better = "  (faster)" if delta_us < 0 else "  (slower)" if delta_us > 0 else ""
+        lines.append(f"{'Kernel timing (us)':30s}  {prev_timing:9.3f} -> {cur_timing:9.3f}  ({arrow} {abs(delta_us):.3f}){better}")
+
+    # Speedup delta
+    cur_spd = current.get("speedup", 1.0)
+    prev_spd = previous.get("speedup", 1.0)
+    if cur_spd != prev_spd:
+        lines.append(f"{'Speedup':30s}  {prev_spd:9.3f}x -> {cur_spd:9.3f}x")
+
+    # Occupancy delta
+    cur_occ = current.get("sm_occupancy", 0)
+    prev_occ = previous.get("sm_occupancy", 0)
+    if cur_occ != prev_occ and (cur_occ > 0 or prev_occ > 0):
+        delta = cur_occ - prev_occ
+        arrow = "^" if delta > 0 else "v" if delta < 0 else "="
+        lines.append(f"{'SM occupancy':30s}  {prev_occ:6.1f}% -> {cur_occ:6.1f}%  ({arrow} {abs(delta):.1f})")
+
+    # Compiler metric deltas
+    cur_cm = current.get("_compiler", {})
+    prev_cm = previous.get("_compiler", {})
+    if cur_cm and prev_cm:
+        cur_regs = cur_cm.get("registers_per_thread", 0)
+        prev_regs = prev_cm.get("registers_per_thread", 0)
+        if cur_regs != prev_regs:
+            lines.append(f"{'Registers/thread':30s}  {prev_regs:6d}  -> {cur_regs:6d}")
+
+        cur_spills = cur_cm.get("spill_stores_bytes", 0) + cur_cm.get("spill_loads_bytes", 0)
+        prev_spills = prev_cm.get("spill_stores_bytes", 0) + prev_cm.get("spill_loads_bytes", 0)
+        if cur_spills != prev_spills:
+            warn = "  *** REGRESSED ***" if cur_spills > prev_spills else "  (improved)" if cur_spills < prev_spills else ""
+            lines.append(f"{'Register spill bytes':30s}  {prev_spills:6d}  -> {cur_spills:6d}{warn}")
+
+        for label, key in [
+            ("Shared memory bytes", "static_smem_bytes"),
+            ("Stack frame bytes", "stack_frame_bytes"),
+            ("Constant memory bytes", "cmem_bytes"),
+        ]:
+            cur_v = cur_cm.get(key, 0)
+            prev_v = prev_cm.get(key, 0)
+            if cur_v != prev_v and (cur_v > 0 or prev_v > 0):
+                lines.append(f"{label:30s}  {prev_v:6d}  -> {cur_v:6d}")
+
+    lines.append("```")
+
+    # Only return if we actually have deltas (more than header + backticks)
+    if len(lines) <= 3:
+        return ""
+    return "\n".join(lines)
+
+
+# ── Launch function signatures (must match harness exactly) ──────────────────
+
