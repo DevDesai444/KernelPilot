@@ -185,3 +185,90 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 
 # ── Last failed refinement error ──────────────────────────────────────────────
 
+def _format_last_error_section(candidate) -> str:
+    """If the model's last refinement attempt failed, show the error so it
+    doesn't repeat the same mistake."""
+    error = getattr(candidate, 'last_refine_error', '')
+    if not error:
+        return ""
+    # Truncate long errors to keep the prompt focused
+    if len(error) > 600:
+        error = error[:600] + "\n... (truncated)"
+    return dedent(f"""\
+
+        ### Your Last Refinement Attempt FAILED
+        ```
+        {error}
+        ```
+        Do NOT repeat this mistake. Fix the error while improving performance.
+    """)
+
+
+# ── Proven-ineffective detection ──────────────────────────────────────────────
+
+def _compute_proven_ineffective(latest: dict, best: dict) -> tuple:
+    """Stubbed: We no longer track hardcoded 'ineffective' metrics.
+    We pass pure universal metrics and let the LLM deduce failure."""
+    return set(), []
+
+
+# ── Data-driven optimization suggestions ─────────────────────────────────────
+
+_REDUCTION_KERNEL_TYPES = frozenset({
+    "add_rmsnorm", "rmsnorm", "layernorm", "softmax", "logsoftmax",
+    "cross_entropy", "rms_norm", "layer_norm",
+})
+
+
+def _format_suggestions_section(metrics: dict, ineffective: set = None,
+                                 kernel_type: str = "") -> str:
+    """Generate data-driven suggestions from runtime and compiler-resource data."""
+    cm = metrics.get("_compiler", {})
+
+    hints: list[str] = []
+    occupancy = metrics.get("sm_occupancy", 0)
+
+    spill_total = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
+    if spill_total > 0:
+        hints.append(
+            f"Register spills ({spill_total} bytes) — reduce live state or simplify per-thread work"
+        )
+    regs = cm.get("registers_per_thread", 0)
+    if regs >= 96:
+        hints.append(
+            f"High register count ({regs} per thread) — trim live ranges before adding more fused work"
+        )
+    if occupancy > 0 and occupancy < 75.0:
+        hints.append(
+            f"Low SM occupancy ({occupancy:.1f}%) — prefer smaller localized changes that preserve occupancy"
+        )
+    if not hints:
+        return ""
+
+    lines = ["\n### Optimization Signals"]
+    for h in hints:
+        lines.append(f"- {h}")
+    return "\n".join(lines)
+
+
+# ── Refinement history ────────────────────────────────────────────────────────
+
+def _format_history_section(candidate) -> str:
+    """Show the model what optimizations were already tried across rounds."""
+    history = getattr(candidate, 'refinement_history', [])
+    if not history:
+        return ""
+    lines = ["\n### Refinement History (do NOT repeat failed/stagnant approaches)"]
+    for entry in history:
+        outcome = entry.get("outcome", "?")
+        speedup = entry.get("speedup", 0)
+        strategy = entry.get("strategy", "?")
+        rnd = entry.get("round", "?")
+        desc = entry.get("strategy_desc", "")
+        lines.append(f"- Round {rnd}: {strategy} → {outcome} ({speedup:.3f}x)")
+        # Show what was tried for failed attempts so the LLM avoids repeating them
+        if desc and outcome in ("regression", "stagnant", "compile_fail", "correctness_fail"):
+            lines.append(f"  Attempted: {desc[:200]}")
+    return "\n".join(lines)
+
+
