@@ -406,3 +406,75 @@ def _format_delta_section(current: dict, previous: dict,
 
 # ── Launch function signatures (must match harness exactly) ──────────────────
 
+def _get_launch_signature(kernel_type: str) -> str:
+    """Return the EXACT launch function signature the harness expects.
+    If the kernel changes this, it gets 'undefined reference' linker errors."""
+    sigs = {
+        "add_rmsnorm": dedent("""\
+            ### Required Launch Function (DO NOT CHANGE)
+            The benchmark harness calls this exact function. Your code MUST define it with this exact signature:
+            ```c
+            void launch_fused_add_rmsnorm_nvfp4(
+                const __nv_bfloat16* input,
+                const __nv_bfloat16* residual,
+                const __nv_bfloat16* weight,
+                __nv_bfloat16* residual_out,
+                unsigned char* quant_out,
+                __nv_fp8_storage_t* scale_out,
+                int rows, int hidden,
+                cudaStream_t stream);
+            ```
+            - `unsigned char*` for quant_out, NOT `uint8_t*`
+            - `__nv_fp8_storage_t*` for scale_out
+            - Exactly 9 parameters in this order
+        """),
+        "silu_mul": dedent("""\
+            ### Required Launch Function (DO NOT CHANGE)
+            The benchmark harness calls this exact function. Your code MUST define it with this exact signature:
+            ```c
+            void launch_silu_mul_fp4quant(
+                const __nv_bfloat16* gate,
+                const __nv_bfloat16* up,
+                uint8_t* quant_out,
+                __nv_fp8_storage_t* scale_out,
+                int N,
+                cudaStream_t stream);
+            ```
+            - Exactly 6 parameters in this order
+        """),
+        "nvfp4_quantize": dedent("""\
+            ### Required Launch Function (DO NOT CHANGE)
+            The benchmark harness calls this exact function. Your code MUST define it with this exact signature:
+            ```c
+            void launch_nvfp4_quantize_bf16(
+                const __nv_bfloat16* input,
+                uint8_t* packed_out,
+                __nv_fp8_storage_t* scale_out,
+                int N,
+                cudaStream_t stream);
+            ```
+            - Exactly 5 parameters in this order
+        """),
+    }
+    return sigs.get(kernel_type, "")
+
+
+# ── Critical rules footer ────────────────────────────────────────────────────
+
+CRITICAL_RULES = dedent("""\
+    ### Critical Rules
+    1. Return the COMPLETE .cu file in a single ```cuda code block.
+    2. Keep all #includes (use the original #include directives, NOT expanded content).
+    3. Do NOT use torch headers (torch/extension.h, ATen, c10) -- this is standalone CUDA.
+    4. Keep ALL kernel functions and the launch_* wrapper function.
+    5. The launch_* function signature MUST match the "Required Launch Function" section EXACTLY.
+       If you change it, the code will fail with "undefined reference" linker errors.
+    6. Output must match reference within atol=1e-2.
+    7. NEVER put __syncthreads() inside an if/else branch -- all threads in a block MUST hit the same barrier or the kernel will deadlock.
+    8. No explanations -- just the code block.
+    9. Only call functions defined in the included headers. Do NOT invent helper functions.
+""")
+
+
+# ── Main reflection dispatcher ───────────────────────────────────────────────
+
