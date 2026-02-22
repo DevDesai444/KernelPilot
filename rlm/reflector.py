@@ -478,3 +478,82 @@ CRITICAL_RULES = dedent("""\
 
 # ── Main reflection dispatcher ───────────────────────────────────────────────
 
+def reflect(
+    candidate,
+    iteration: int,
+    hw_spec: dict,
+    kernel_type: str = "",
+    baseline_us: float = 0.0,
+    prev_metrics: dict = None,
+    atol: float = 1e-2,
+    original_kernel_src: str = "",
+    **kwargs,  # absorb unused args (target_speedup, min_speedup) from callers
+) -> str:
+    """Generate a reflection prompt based on the candidate's result.
+
+    3 paths:
+      1. compile_ok=False → COMPILE_REFLECTION + compiler error
+      2. correct=False    → CORRECTNESS_REFLECTION
+      3. otherwise        → PERFORMANCE_REFLECTION + reward score + profiler data
+    """
+    solution = candidate.code or "# (no code generated)"
+    metrics = candidate.metrics or {}
+    speedup = candidate.speedup
+    hw_context = _build_hw_context(hw_spec)
+    launch_sig = _get_launch_signature(kernel_type)
+    profile_section = _format_profile_section(metrics, iteration)
+    delta_section = _format_delta_section(metrics, prev_metrics)
+    stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration, candidate=candidate)
+    last_error_section = _format_last_error_section(candidate)
+    history_section = _format_history_section(candidate)
+    suggestions_section = _format_suggestions_section(metrics, kernel_type=kernel_type)
+
+    reward, reward_breakdown = compute_reward(
+        candidate.compile_ok, candidate.correct, speedup
+    )
+
+    # Reference source section — gives the model the original headers/types
+    ref_section = ""
+    if original_kernel_src:
+        ref_section = dedent(f"""\
+
+            ### Reference kernel (headers expanded — use these types and functions):
+            ```cuda
+            {original_kernel_src}
+            ```
+        """)
+
+    # Common footer: reference source + launch signature + hw context + rules
+    footer = "\n" + ref_section + "\n" + launch_sig + "\n" + hw_context + "\n" + CRITICAL_RULES
+
+    if not candidate.compile_ok:
+        error = getattr(candidate, 'compile_error', '') or "Unknown compilation error"
+        return COMPILE_REFLECTION.format(
+            iteration=iteration,
+            reward=reward,
+            reward_breakdown=reward_breakdown,
+            error=error,
+            solution=solution,
+        ) + footer
+
+    if not candidate.correct:
+        return CORRECTNESS_REFLECTION.format(
+            iteration=iteration,
+            reward=reward,
+            reward_breakdown=reward_breakdown,
+            solution=solution,
+        ) + footer
+
+    return PERFORMANCE_REFLECTION.format(
+        iteration=iteration,
+        reward=reward,
+        reward_breakdown=reward_breakdown,
+        speedup=speedup,
+        solution=solution,
+        profile_section=profile_section,
+        suggestions_section=suggestions_section,
+        delta_section=delta_section,
+        stagnation_section=stagnation_section,
+        last_error_section=last_error_section,
+        history_section=history_section,
+    ) + footer
