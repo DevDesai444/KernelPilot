@@ -93,3 +93,81 @@ class SandboxFeedback:
             payload["error"] = self.error[:600]
         return payload
 
+    def to_tool_result_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+    def planner_summary(self) -> str:
+        summary = {
+            "verdict": self.status,
+            "route": self.route,
+            "speedup": round(self.speedup, 6),
+            "parent_speedup": round(self.parent_speedup, 6),
+            "uncertainty": self.uncertainty,
+            "hypothesis_test": {
+                "previous_hypothesis": self.hypothesis_test.get("previous_hypothesis", ""),
+                "status": self.hypothesis_test.get("status", ""),
+            },
+            "next_action": {
+                "type": self.action_type,
+                "instruction": self.next_action,
+                "focus": self.focus[:6],
+            },
+            "memory": {
+                "branch_family": self.memory.get("branch_family", ""),
+                "plateau_count": self.memory.get("plateau_count", 0),
+                "tried_and_failed": self.memory.get("tried_and_failed", [])[:6],
+                "tried_and_helped": self.memory.get("tried_and_helped", [])[:6],
+            },
+            "rag": {
+                "queries": self.rag_queries[:6],
+                "filters": self.rag_filters,
+            },
+        }
+        if self.observations:
+            summary["observations"] = {
+                key: self.observations[key]
+                for key in ("timing_us", "speedup", "delta_vs_parent")
+                if key in self.observations
+            }
+        if self.evidence:
+            summary["evidence"] = self.evidence[:10]
+        return json.dumps(summary, indent=2, sort_keys=True)
+
+
+def _first_actionable_error(error: str) -> str:
+    if not error:
+        return "Unknown compiler error."
+    lines = [line.strip() for line in error.splitlines() if line.strip()]
+    actionable = [
+        line for line in lines
+        if "error" in line.lower() and ("(" in line or ":" in line)
+    ]
+    return actionable[0] if actionable else lines[0]
+
+
+def _metric_evidence(name: str, value, kind: str = "metric", unit: str | None = None) -> dict:
+    item = {"kind": kind, "name": name, "value": value}
+    if unit:
+        item["unit"] = unit
+    return item
+
+
+def _delta_evidence(name: str, before, after, unit: str | None = None) -> dict:
+    item = {"kind": "delta", "name": name, "before": before, "after": after}
+    if unit:
+        item["unit"] = unit
+    return item
+
+
+def _kernel_operation_phrase(kernel_type: str) -> str:
+    context = KERNEL_QUERY_CONTEXT.get(kernel_type, {})
+    return context.get("operation", kernel_type.replace("_", " "))
+
+
+def _kernel_aliases(kernel_type: str) -> list[str]:
+    context = KERNEL_QUERY_CONTEXT.get(kernel_type, {})
+    aliases = list(context.get("aliases", []))
+    aliases.append(kernel_type.replace("_", " "))
+    return [alias for alias in aliases if alias]
+
+
