@@ -54,3 +54,42 @@ class SandboxFeedback:
     abort_if: list[str] = field(default_factory=list)
     error: str = ""
 
+    def to_payload(self) -> dict:
+        preserve = _unique_queries(self.preserve)
+        revert = _unique_queries(self.revert)
+        avoid = _unique_queries(self.avoid)
+        focus = _unique_queries(self.focus)
+        success_criteria = _unique_queries(self.success_criteria)
+        abort_if = _unique_queries(self.abort_if)
+        payload = {
+            "verdict": self.status,
+            "stage": self.stage,
+            "route": self.route,
+            "confidence": self.confidence,
+            "speedup": round(self.speedup, 6),
+            "parent_speedup": round(self.parent_speedup, 6),
+            "uncertainty": self.uncertainty,
+            "observations": self.observations,
+            "hypothesis_test": self.hypothesis_test,
+            "evidence": self.evidence,
+            "next_action": {
+                "type": self.action_type,
+                "instruction": self.next_action,
+                "preserve": preserve,
+                "revert": revert,
+                "avoid": avoid,
+                "focus": focus,
+                "success_criteria": success_criteria,
+                "abort_if": abort_if,
+            },
+            "memory": self.memory,
+            "rag": {
+                "provider": "pinecone",
+                "queries": self.rag_queries,
+                "filters": self.rag_filters,
+            },
+        }
+        if self.error:
+            payload["error"] = self.error[:600]
+        return payload
+
