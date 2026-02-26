@@ -171,3 +171,50 @@ def _kernel_aliases(kernel_type: str) -> list[str]:
     return [alias for alias in aliases if alias]
 
 
+def _unique_queries(queries: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for query in queries:
+        cleaned = " ".join(str(query).split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(cleaned)
+    return ordered
+
+
+def _get_candidate_attr(candidate: Any, name: str, default):
+    if candidate is None:
+        return default
+    return getattr(candidate, name, default)
+
+
+def _candidate_plan(candidate: Any) -> dict:
+    plan = _get_candidate_attr(candidate, "plan_branch", {}) or {}
+    return plan if isinstance(plan, dict) else {}
+
+
+def _branch_family(candidate: Any) -> str:
+    family = _get_candidate_attr(candidate, "branch_family", "") or ""
+    if family:
+        return family
+    parent_strategy = _get_candidate_attr(candidate, "parent_strategy", "") or ""
+    if parent_strategy:
+        return parent_strategy.split("__", 1)[0]
+    strategy = _get_candidate_attr(candidate, "strategy", "") or ""
+    return strategy.split("__", 1)[0]
+
+
+def _latest_experiment_label(candidate: Any) -> str:
+    plan = _candidate_plan(candidate)
+    for key in ("change_summary", "what", "goal", "bottleneck", "name"):
+        value = plan.get(key)
+        if value:
+            return str(value)
+    strategy = _get_candidate_attr(candidate, "strategy", "")
+    return strategy or "latest optimization attempt"
+
+
