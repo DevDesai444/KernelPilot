@@ -218,3 +218,71 @@ def _latest_experiment_label(candidate: Any) -> str:
     return strategy or "latest optimization attempt"
 
 
+def _candidate_memory(candidate: Any, uncertainty: str) -> dict:
+    history = list(_get_candidate_attr(candidate, "refinement_history", []) or [])
+    failed = []
+    helped = []
+    plateau_count = 0
+
+    for entry in history[-8:]:
+        label = (
+            entry.get("branch")
+            or entry.get("strategy_desc")
+            or entry.get("strategy")
+            or "unnamed_change"
+        )
+        outcome = entry.get("outcome", "")
+        if outcome == "improved":
+            helped.append(label)
+        elif outcome in {"compile_fail", "correctness_fail", "regression", "stagnant"}:
+            failed.append(label)
+        if outcome == "stagnant":
+            plateau_count += 1
+
+    return {
+        "branch_family": _branch_family(candidate),
+        "best_branch_family": _branch_family(candidate),
+        "latest_experiment": _latest_experiment_label(candidate),
+        "plateau_count": plateau_count,
+        "refine_attempts": int(_get_candidate_attr(candidate, "refine_attempts", 0) or 0),
+        "tried_and_failed": failed[-4:],
+        "tried_and_helped": helped[-4:],
+        "uncertainty": uncertainty,
+    }
+
+
+def _experiment_focus_terms(metrics: dict, memory: dict) -> list[str]:
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    focus = []
+
+    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0):
+        focus.append("spill elimination")
+    if compiler.get("registers_per_thread", 0) > 40:
+        focus.extend(["register pressure", "occupancy tuning", "launch bounds"])
+    occupancy = metrics.get("sm_occupancy", 0)
+    if occupancy and occupancy < 90.0:
+        focus.extend(["latency hiding", "occupancy tuning", "independent work per thread"])
+
+    family = memory.get("branch_family", "")
+    if family:
+        focus.append(family.replace("_", " "))
+    if not focus:
+        focus.extend(["minimal adaptation", "preserve working structure", "localized experiment"])
+
+    return _unique_queries(focus)
+
+
+def _build_targeted_query(kernel_type: str, focus_terms: list[str], memory: dict) -> str:
+    operation = _kernel_operation_phrase(kernel_type)
+    aliases = ", ".join(_kernel_aliases(kernel_type)[:4])
+    optimizations = ", ".join(focus_terms[:4]) or "instruction mix"
+    latest = memory.get("latest_experiment", "")
+    return (
+        f"Operation: {operation}. "
+        f"Aliases: {aliases}. "
+        f"Current experiment: {latest}. "
+        f"Optimizations: {optimizations}. "
+        f"Need: production CUDA kernel source_code."
+    )
+
+
