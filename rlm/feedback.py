@@ -286,3 +286,68 @@ def _build_targeted_query(kernel_type: str, focus_terms: list[str], memory: dict
     )
 
 
+def _performance_queries(kernel_type: str, metrics: dict, memory: dict) -> list[str]:
+    focus_terms = _experiment_focus_terms(metrics, memory)
+    operation = _kernel_operation_phrase(kernel_type)
+    queries = [_build_targeted_query(kernel_type, focus_terms, memory)]
+
+    latest = memory.get("latest_experiment", "")
+    family = memory.get("branch_family", "")
+    if latest:
+        queries.append(f"{operation} {latest} CUDA source code")
+    if family:
+        queries.append(f"{operation} {family.replace('_', ' ')} production CUDA source code")
+    if focus_terms:
+        queries.append(f"{operation} {' '.join(focus_terms[:2])} CUDA source code")
+
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    spill_total = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
+    regs = compiler.get("registers_per_thread", 0)
+    occupancy = float(metrics.get("sm_occupancy", 0) or 0.0)
+    reg_limit = 96
+    occ_limit = 75.0
+    if kernel_type == "add_rmsnorm":
+        reg_limit = 40
+        occ_limit = 90.0
+    if spill_total > 0:
+        queries.append(f"{operation} reduce register spills live range CUDA")
+    elif regs > reg_limit or (regs > 0 and occupancy < occ_limit):
+        queries.append(f"{operation} lower register pressure occupancy CUDA")
+    else:
+        queries.append(f"{operation} minimal adaptation best production kernel CUDA")
+
+    return _unique_queries(queries)
+
+
+def _collect_performance_evidence(
+    speedup: float,
+    parent_speedup: float,
+    metrics: dict,
+    prev_inner_metrics: dict | None,
+) -> list[dict]:
+    evidence = [
+        _metric_evidence("speedup", round(speedup, 6), unit="x"),
+        _delta_evidence("speedup", round(parent_speedup, 6), round(speedup, 6), unit="x"),
+    ]
+
+    for key, unit in (
+        ("duration_us", "us"),
+        ("sm_occupancy", "%"),
+    ):
+        value = metrics.get(key)
+        if value is not None and value != 0:
+            evidence.append(_metric_evidence(key, round(float(value), 3), unit=unit))
+
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    prev_compiler = (prev_inner_metrics or {}).get("_compiler", {})
+    for key in OBSERVATION_COMPILER_KEYS:
+        value = compiler.get(key)
+        if value is None:
+            continue
+        evidence.append(_metric_evidence(key, value, kind="compiler"))
+        if key in prev_compiler and prev_compiler.get(key) != value:
+            evidence.append(_delta_evidence(key, prev_compiler.get(key), value))
+
+    return evidence[:16]
+
+
