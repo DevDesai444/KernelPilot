@@ -351,3 +351,53 @@ def _collect_performance_evidence(
     return evidence[:16]
 
 
+def _build_observations(
+    compile_ok: bool,
+    correct: bool,
+    speedup: float,
+    parent_speedup: float,
+    metrics: dict,
+    prev_inner_metrics: dict | None,
+    error: str = "",
+) -> dict:
+    observations = {
+        "compile_ok": bool(compile_ok),
+        "correct": bool(correct),
+        "speedup": round(speedup, 6),
+        "parent_speedup": round(parent_speedup, 6),
+    }
+
+    duration_us = metrics.get("duration_us")
+    if duration_us:
+        observations["timing_us"] = round(float(duration_us), 3)
+    for key in ("sm_occupancy",):
+        value = metrics.get(key)
+        if value:
+            observations[key] = round(float(value), 3)
+
+    delta_vs_parent = {}
+    if parent_speedup:
+        delta_vs_parent["speedup"] = round(speedup - parent_speedup, 6)
+
+    prev_metrics = prev_inner_metrics or {}
+    for key in ("duration_us", "sm_occupancy"):
+        before = prev_metrics.get(key)
+        after = metrics.get(key)
+        if before is not None and after is not None and before != after:
+            delta_vs_parent[key] = round(float(after) - float(before), 3)
+
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    prev_compiler = prev_metrics.get("_compiler", {}) if prev_metrics else {}
+    for key in OBSERVATION_COMPILER_KEYS:
+        before = prev_compiler.get(key)
+        after = compiler.get(key)
+        if before is not None and after is not None and before != after:
+            delta_vs_parent[key] = after - before
+
+    if delta_vs_parent:
+        observations["delta_vs_parent"] = delta_vs_parent
+    if error:
+        observations["error"] = error[:240]
+    return observations
+
+
