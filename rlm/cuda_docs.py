@@ -296,3 +296,49 @@ CUDA_INTRINSICS_DB = [
 ]
 
 
+def search_intrinsics(query: str, max_results: int = 8) -> str:
+    """Search the CUDA intrinsics database using BM25-style fuzzy matching."""
+    import re
+    query_lower = query.lower()
+    keywords = set(re.findall(r'\w+', query_lower))
+
+    scored = []
+    for entry in CUDA_INTRINSICS_DB:
+        score = 0.0
+        searchable_text = (
+            entry["name"].lower() + " " +
+            entry.get("description", "").lower() + " " +
+            " ".join(entry.get("tags", []))
+        )
+        
+        for kw in keywords:
+            # Boost exact name matches massively
+            if kw in entry["name"].lower():
+                score += 15.0
+            
+            # Count term frequencies in the description/tags
+            tf = searchable_text.count(kw)
+            if tf > 0:
+                # Diminishing returns for spamming the same word (BM25 principle)
+                score += 3.0 * (tf / (tf + 0.5))
+                
+        if score > 0:
+            scored.append((score, entry))
+
+    scored.sort(key=lambda x: -x[0])
+    results = scored[:max_results]
+
+    if not results:
+        return f"No results found for '{query}'. Try keywords like: fp4, fp8, e4m3, reduction, shuffle, fast math, bfloat16, fma, ldg, stcg, async"
+
+    lines = []
+    for _, entry in results:
+        lines.append(f"## {entry['name']}")
+        lines.append(f"Header: #include <{entry['header']}>")
+        lines.append(f"```cpp\n{entry['signature']}\n```")
+        lines.append(entry.get("description", ""))
+        if "example" in entry:
+            lines.append(f"Example: `{entry['example']}`")
+        lines.append("")
+
+    return "\n".join(lines)
