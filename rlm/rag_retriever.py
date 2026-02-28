@@ -59,3 +59,74 @@ SOURCE_QUALITY_WEIGHTS = {
 
 
 @dataclass
+class PineconeMatch:
+    match_id: str
+    score: float
+    text: str
+    title: str = ""
+    source: str = ""
+    metadata: dict | None = None
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "path": self.source,
+            "content": self.text,
+            "title": self.title or self.match_id,
+            "metadata": self.metadata or {},
+            "score": self.score,
+        }
+
+
+class PineconeRetriever:
+    def __init__(self, config: dict | None = None):
+        load_project_env()
+        cfg = config or {}
+        self.enabled = str(cfg.get("provider", "pinecone")).lower() == "pinecone"
+        self.top_k = int(cfg.get("top_k", 4))
+        self.namespace = cfg.get("namespace") or os.getenv(
+            cfg.get("namespace_env", "PINECONE_NAMESPACE")
+        )
+        self.fields = list(
+            cfg.get(
+                "fields",
+                [
+                    "chunk_text",
+                    "title",
+                    "source",
+                    "source_code",
+                    "source_file",
+                    "optimization_pattern",
+                    "op_type",
+                ],
+            )
+        )
+        self.text_field = cfg.get("text_field", "chunk_text")
+        self.title_field = cfg.get("title_field", "title")
+        self.source_field = cfg.get("source_field", "source")
+        self.api_key_env = cfg.get("api_key_env", "PINECONE_API_KEY")
+        self.index_host_env = cfg.get("index_host_env", "PINECONE_INDEX_HOST")
+        self.index_name_env = cfg.get("index_name_env", "PINECONE_INDEX_NAME")
+        self.embed_provider_env = cfg.get("embed_provider_env", "PINECONE_EMBED_PROVIDER")
+        self.embed_model_env = cfg.get("embed_model_env", "PINECONE_EMBED_MODEL")
+        self.rerank_model_env = cfg.get("rerank_model_env", "PINECONE_RERANK_MODEL")
+        self.default_filter = cfg.get("metadata_filter") or None
+        self.index_name = cfg.get("index_name") or os.getenv(self.index_name_env)
+        self.index_host = cfg.get("index_host") or None
+        self.embed_provider = cfg.get("embed_provider") or os.getenv(
+            self.embed_provider_env, "sentence-transformers"
+        )
+        self.embed_model = cfg.get("embed_model") or os.getenv(
+            self.embed_model_env, "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.rerank_model = cfg.get("rerank_model") or os.getenv(self.rerank_model_env, "")
+        self.rerank_pool = int(cfg.get("rerank_pool", 12))
+        self.candidate_pool_multiplier = int(cfg.get("candidate_pool_multiplier", 3))
+        self.source_cap = int(cfg.get("source_cap", 2))
+        self.format_max_chars = int(cfg.get("format_max_chars", 16000))
+        self.match_max_chars = int(cfg.get("match_max_chars", 4000))
+        self.last_query_mode = "uninitialized"
+
+        self._client = None
+        self._index = None
+        self._init_error = ""
+
