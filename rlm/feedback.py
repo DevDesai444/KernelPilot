@@ -557,3 +557,224 @@ def _compiler_queries(kernel_type: str, error: str) -> list[str]:
     return _unique_queries(queries)
 
 
+def build_sandbox_feedback(
+    result: dict,
+    parent_speedup: float,
+    prev_inner_metrics: dict | None,
+    kernel_type: str,
+    candidate: Any = None,
+) -> SandboxFeedback:
+    compile_ok = result.get("compile_ok", False)
+    correct = result.get("correct", False)
+    speedup = float(result.get("speedup", 0.0) or 0.0)
+    _binary = result.get("binary_speedup")
+    routing_speedup = max(speedup, float(_binary)) if _binary is not None else speedup
+    metrics = result.get("metrics", {}) or {}
+    error = result.get("error", "") or ""
+
+    if not compile_ok:
+        uncertainty = "Compiler output is authoritative for this failure."
+        memory = _candidate_memory(candidate, uncertainty)
+        observations = _build_observations(
+            compile_ok=False,
+            correct=False,
+            speedup=0.0,
+            parent_speedup=parent_speedup,
+            metrics=metrics,
+            prev_inner_metrics=prev_inner_metrics,
+            error=error,
+        )
+        hypothesis_test = _hypothesis_test(
+            speedup=0.0,
+            parent_speedup=parent_speedup,
+            metrics=metrics,
+            prev_inner_metrics=prev_inner_metrics,
+            candidate=candidate,
+            compile_ok=False,
+            correct=False,
+            error=error,
+        )
+        instruction = "Fix the compiler error and keep the launch contract unchanged."
+        return SandboxFeedback(
+            status="compile_error",
+            stage="compile",
+            route="fixer_with_rag",
+            confidence=0.98,
+            speedup=0.0,
+            parent_speedup=parent_speedup,
+            uncertainty=uncertainty,
+            next_action=instruction,
+            action_type="repair_compile",
+            evidence=[
+                _metric_evidence("speedup", 0.0, unit="x"),
+                {"kind": "compiler_error", "name": "first_error", "value": _first_actionable_error(error)},
+            ],
+            observations=observations,
+            hypothesis_test=hypothesis_test,
+            memory=memory,
+            rag_queries=_compiler_queries(kernel_type, error),
+            rag_filters={"kernel_type": kernel_type, "failure_mode": "compile_error"},
+            preserve=["launch_signature", "kernel_interface"],
+            revert=[],
+            avoid=["signature_changes", "unrelated_optimizations"],
+            focus=["compiler_error", "include_paths", "wrapper_signature"],
+            success_criteria=["Compilation succeeds without changing the launch contract."],
+            abort_if=["The fix requires changing the kernel interface or wrapper signature."],
+            error=error,
+        )
+
+    if not correct:
+        uncertainty = "Correctness failures must be fixed before any performance diagnosis matters."
+        memory = _candidate_memory(candidate, uncertainty)
+        observations = _build_observations(
+            compile_ok=True,
+            correct=False,
+            speedup=speedup,
+            parent_speedup=parent_speedup,
+            metrics=metrics,
+            prev_inner_metrics=prev_inner_metrics,
+            error=error,
+        )
+        hypothesis_test = _hypothesis_test(
+            speedup=speedup,
+            parent_speedup=parent_speedup,
+            metrics=metrics,
+            prev_inner_metrics=prev_inner_metrics,
+            candidate=candidate,
+            compile_ok=True,
+            correct=False,
+            error=error,
+        )
+        return SandboxFeedback(
+            status="correctness_failure",
+            stage="correctness",
+            route="fixer_with_rag",
+            confidence=0.95,
+            speedup=speedup,
+            parent_speedup=parent_speedup,
+            uncertainty=uncertainty,
+            next_action="Repair correctness before making any new optimization change.",
+            action_type="repair_correctness",
+            evidence=_collect_performance_evidence(speedup, parent_speedup, metrics, prev_inner_metrics),
+            observations=observations,
+            hypothesis_test=hypothesis_test,
+            memory=memory,
+            rag_queries=[
+                f"{kernel_type} CUDA correctness fix",
+                f"{kernel_type} kernel numerics debugging",
+            ],
+            rag_filters={"kernel_type": kernel_type, "failure_mode": "correctness_failure"},
+            preserve=["launch_signature"],
+            revert=[],
+            avoid=["new_optimizations", "algorithm_changes_before_fix"],
+            focus=["numerics", "bounds", "synchronization"],
+            success_criteria=["Correctness passes before any new optimization is attempted."],
+            abort_if=["A new performance optimization is introduced before the mismatch is fixed."],
+            error=error,
+        )
+
+    uncertainty = (
+        "Trust runtime delta, correctness, registers, spills, and occupancy. "
+        "Treat estimated throughput figures as context only."
+    )
+    memory = _candidate_memory(candidate, uncertainty)
+    observations = _build_observations(
+        compile_ok=True,
+        correct=True,
+        speedup=speedup,
+        parent_speedup=parent_speedup,
+        metrics=metrics,
+        prev_inner_metrics=prev_inner_metrics,
+    )
+    hypothesis_test = _hypothesis_test(
+        speedup=speedup,
+        parent_speedup=parent_speedup,
+        metrics=metrics,
+        prev_inner_metrics=prev_inner_metrics,
+        candidate=candidate,
+        compile_ok=True,
+        correct=True,
+    )
+    evidence = _collect_performance_evidence(speedup, parent_speedup, metrics, prev_inner_metrics)
+    queries = _performance_queries(kernel_type, metrics, memory)
+    instruction, preserve, revert, avoid, focus, success_criteria, abort_if = _next_experiment_fields(
+        status=hypothesis_test["status"],
+        metrics=metrics,
+        candidate=candidate,
+        speedup=speedup,
+        parent_speedup=parent_speedup,
+    )
+
+    if routing_speedup < 1.0:
+        return SandboxFeedback(
+            status="below_baseline",
+            stage="benchmark",
+            route="fixer_with_rag",
+            confidence=0.88,
+            speedup=speedup,
+            parent_speedup=parent_speedup,
+            uncertainty=uncertainty,
+            next_action=instruction,
+            action_type="revise_experiment",
+            evidence=evidence,
+            observations=observations,
+            hypothesis_test=hypothesis_test,
+            memory=memory,
+            rag_queries=queries,
+            rag_filters={"kernel_type": kernel_type, "failure_mode": "below_baseline"},
+            preserve=preserve,
+            revert=revert,
+            avoid=avoid + ["new_branch_family"],
+            focus=focus,
+            success_criteria=success_criteria,
+            abort_if=abort_if,
+        )
+
+    if routing_speedup > parent_speedup + 0.02:
+        return SandboxFeedback(
+            status="improved",
+            stage="benchmark",
+            route="planner_tree",
+            confidence=0.86,
+            speedup=speedup,
+            parent_speedup=parent_speedup,
+            uncertainty=uncertainty,
+            next_action="Preserve the working structure and branch into one surgical follow-up experiment.",
+            action_type="branch_tree",
+            evidence=evidence,
+            observations=observations,
+            hypothesis_test=hypothesis_test,
+            memory=memory,
+            rag_queries=queries,
+            rag_filters={"kernel_type": kernel_type, "failure_mode": "improved"},
+            preserve=preserve,
+            revert=revert,
+            avoid=avoid + ["full_rewrite"],
+            focus=focus,
+            success_criteria=success_criteria,
+            abort_if=abort_if,
+        )
+
+    return SandboxFeedback(
+        status="plateaued_above_baseline",
+        stage="benchmark",
+        route="fixer_with_rag",
+        confidence=0.82,
+        speedup=speedup,
+        parent_speedup=parent_speedup,
+        uncertainty=uncertainty,
+        next_action=instruction,
+        action_type="targeted_refine",
+        evidence=evidence,
+        observations=observations,
+        hypothesis_test=hypothesis_test,
+        memory=memory,
+        rag_queries=queries,
+        rag_filters={"kernel_type": kernel_type, "failure_mode": "plateaued_above_baseline"},
+        preserve=preserve,
+        revert=revert,
+        avoid=avoid + ["new_branch_family"],
+        focus=focus,
+        success_criteria=success_criteria,
+        abort_if=abort_if,
+    )
