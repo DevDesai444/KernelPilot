@@ -401,3 +401,81 @@ def _build_observations(
     return observations
 
 
+def _metric_support(metrics: dict, prev_inner_metrics: dict | None) -> tuple[list[str], list[str]]:
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    prev_compiler = (prev_inner_metrics or {}).get("_compiler", {})
+    evidence_for = []
+    evidence_against = []
+
+    before_occ = (prev_inner_metrics or {}).get("sm_occupancy")
+    after_occ = metrics.get("sm_occupancy")
+
+    before_spills = prev_compiler.get("spill_stores_bytes", 0) + prev_compiler.get("spill_loads_bytes", 0)
+    after_spills = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
+    if before_spills != after_spills:
+        msg = f"spill_bytes {before_spills} -> {after_spills}"
+        if after_spills < before_spills:
+            evidence_for.append(msg)
+        else:
+            evidence_against.append(msg)
+
+    before_regs = prev_compiler.get("registers_per_thread")
+    after_regs = compiler.get("registers_per_thread")
+    if before_regs is not None and after_regs is not None and before_regs != after_regs:
+        msg = f"registers_per_thread {before_regs} -> {after_regs}"
+        if after_regs < before_regs:
+            evidence_for.append(msg)
+        else:
+            evidence_against.append(msg)
+
+    if before_occ is not None and after_occ is not None and before_occ != after_occ:
+        msg = f"sm_occupancy {before_occ} -> {after_occ}"
+        if after_occ > before_occ:
+            evidence_for.append(msg)
+        else:
+            evidence_against.append(msg)
+
+    return evidence_for, evidence_against
+
+
+def _hypothesis_test(
+    *,
+    speedup: float,
+    parent_speedup: float,
+    metrics: dict,
+    prev_inner_metrics: dict | None,
+    candidate: Any,
+    compile_ok: bool,
+    correct: bool,
+    error: str = "",
+) -> dict:
+    previous_hypothesis = _latest_experiment_label(candidate)
+    evidence_for, evidence_against = _metric_support(metrics, prev_inner_metrics)
+
+    if not compile_ok:
+        status = "inconclusive"
+        evidence_against.append(_first_actionable_error(error))
+    elif not correct:
+        status = "falsified"
+        evidence_against.append(error[:160] or "Correctness failed.")
+    elif speedup > parent_speedup + 0.02:
+        status = "confirmed"
+        evidence_for.append(f"speedup improved {parent_speedup:.3f}x -> {speedup:.3f}x")
+    elif speedup < max(parent_speedup - 0.001, 1.0):
+        status = "falsified"
+        evidence_against.append(f"speedup regressed {parent_speedup:.3f}x -> {speedup:.3f}x")
+    elif evidence_for:
+        status = "inconclusive"
+        evidence_against.append("Compiler or occupancy signals moved, but runtime did not materially improve.")
+    else:
+        status = "inconclusive"
+        evidence_against.append("Runtime held flat, so the previous hypothesis is not yet validated.")
+
+    return {
+        "previous_hypothesis": previous_hypothesis,
+        "status": status,
+        "evidence_for": evidence_for[:4],
+        "evidence_against": evidence_against[:4],
+    }
+
+
