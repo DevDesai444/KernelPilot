@@ -479,3 +479,81 @@ def _hypothesis_test(
     }
 
 
+def _next_experiment_fields(
+    *,
+    status: str,
+    metrics: dict,
+    candidate: Any,
+    speedup: float,
+    parent_speedup: float,
+) -> tuple[str, list[str], list[str], list[str], list[str], list[str], list[str]]:
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    spill_total = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
+    regs = compiler.get("registers_per_thread", 0)
+    occupancy = float(metrics.get("sm_occupancy", 0) or 0.0)
+    preserve = ["launch_signature", "correctness", "working_kernel_structure"]
+    revert = []
+    avoid = ["full_rewrite"]
+    focus = []
+    success_criteria = ["Correctness must hold."]
+    abort_if = []
+
+    history = list(_get_candidate_attr(candidate, "refinement_history", []) or [])
+    if status == "falsified":
+        latest = history[-1] if history else {}
+        label = latest.get("branch") or latest.get("strategy_desc") or latest.get("strategy")
+        if label:
+            revert.append(str(label))
+
+    if spill_total > 0:
+        instruction = "Keep the algorithm unchanged. Remove spills or trim live state around the current working path."
+        focus = ["spill elimination", "live-range trimming", "smaller per-thread state"]
+        success_criteria.extend([
+            "spill bytes go down or disappear.",
+            "timing_us improves against the parent.",
+        ])
+        abort_if = [
+            "register count rises while spills remain.",
+            "the fix requires a launch-contract change.",
+        ]
+    elif regs > 40 or (regs > 0 and occupancy < 90.0):
+        instruction = "Keep the fastest path intact. Reduce register pressure or recover occupancy with one local change."
+        focus = ["register pressure reduction", "occupancy preservation", "launch bounds"]
+        success_criteria.extend([
+            "registers_per_thread drops or occupancy rises.",
+            "runtime does not regress.",
+        ])
+        abort_if = [
+            "spills appear.",
+            "occupancy falls without a meaningful runtime win.",
+        ]
+    else:
+        instruction = "Preserve the working structure and make one localized adaptation of the current best path."
+        focus = ["minimal adaptation", "one localized change", "preserve working structure"]
+        success_criteria.append("timing_us improves against the parent.")
+        abort_if = ["multiple unrelated changes are required to explain the result."]
+
+    if speedup < 1.0:
+        avoid.append("stacking_multiple_changes")
+    elif speedup <= parent_speedup + 0.02:
+        avoid.append("new_branch_family")
+    else:
+        avoid.append("breaking_working_structure")
+
+    return instruction, preserve, revert, avoid, focus, success_criteria[:4], abort_if[:4]
+
+
+def _compiler_queries(kernel_type: str, error: str) -> list[str]:
+    first = _first_actionable_error(error)
+    operation = _kernel_operation_phrase(kernel_type)
+    queries = [
+        f"Operation: {operation}. Problem: CUDA compile error. Signature: {first}. Need: production CUDA source_code.",
+        f"{operation} launch signature compile error CUDA",
+    ]
+    if "__syncthreads" in error:
+        queries.append(f"{operation} __syncthreads divergent branch fix CUDA")
+    if "undefined reference" in error.lower():
+        queries.append(f"{operation} launch wrapper signature linker error CUDA")
+    return _unique_queries(queries)
+
+
