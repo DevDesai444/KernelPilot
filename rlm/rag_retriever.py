@@ -130,3 +130,71 @@ class PineconeRetriever:
         self._index = None
         self._init_error = ""
 
+    def _ensure_index(self):
+        if not self.enabled:
+            self._init_error = "RAG provider is disabled."
+            return None
+
+        if self._index is not None:
+            return self._index
+        if self._init_error:
+            return None
+        if Pinecone is None:
+            self._init_error = "The pinecone package is not installed."
+            return None
+
+        api_key = os.getenv(self.api_key_env)
+        index_host = self.index_host or os.getenv(self.index_host_env)
+        if not api_key or not (index_host or self.index_name):
+            self._init_error = (
+                f"Missing environment variables: {self.api_key_env} and either "
+                f"{self.index_host_env} or {self.index_name_env}."
+            )
+            return None
+
+        try:
+            self._client = Pinecone(api_key=api_key)
+            if index_host:
+                self._index = self._client.Index(host=index_host)
+            else:
+                self._index = self._client.Index(self.index_name)
+        except Exception as exc:  # pragma: no cover - network runtime
+            self._init_error = f"Failed to initialize Pinecone index: {exc}"
+            logger.warning(self._init_error)
+            return None
+
+        return self._index
+
+    def list_indexes(self) -> list[str]:
+        if Pinecone is None:
+            return []
+        api_key = os.getenv(self.api_key_env)
+        if not api_key:
+            return []
+        try:
+            client = self._client or Pinecone(api_key=api_key)
+            listing = client.list_indexes()
+        except Exception as exc:  # pragma: no cover - network runtime
+            logger.warning("Pinecone list_indexes failed: %s", exc)
+            return []
+
+        names = []
+        for item in listing:
+            if isinstance(item, dict):
+                name = item.get("name")
+            else:
+                name = getattr(item, "name", None)
+                if name is None and hasattr(item, "to_dict"):
+                    try:
+                        name = item.to_dict().get("name")
+                    except Exception:
+                        name = None
+            if name:
+                names.append(str(name))
+        return names
+
+    def status(self) -> str:
+        if self._ensure_index() is not None:
+            return "configured"
+        return self._init_error or "not configured"
+
