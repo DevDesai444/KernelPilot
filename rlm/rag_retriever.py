@@ -272,3 +272,87 @@ class PineconeRetriever:
 
         return self._rerank_matches(query, matches, top_n=int(top_k or self.top_k))
 
+    def search_many(
+        self,
+        queries: list[str],
+        top_k: int | None = None,
+        namespace: str | None = None,
+        metadata_filter: dict | None = None,
+        exclude_source_patterns: list[str] | None = None,
+    ) -> list[PineconeMatch]:
+        deduped = {}
+        candidate_top_k = max(
+            int(top_k or self.top_k) * self.candidate_pool_multiplier,
+            self.rerank_pool,
+        )
+        for query in queries:
+            for variant in self._expand_query_variants(query):
+                for match in self.search(
+                    query=variant,
+                    top_k=candidate_top_k,
+                    namespace=namespace,
+                    metadata_filter=metadata_filter,
+                    exclude_source_patterns=exclude_source_patterns,
+                ):
+                    existing = deduped.get(match.match_id)
+                    if existing is None or match.score > existing.score:
+                        deduped[match.match_id] = match
+        if not deduped:
+            return []
+
+        candidates = list(deduped.values())
+        if exclude_source_patterns:
+            before = len(candidates)
+            candidates = [
+                m for m in candidates
+                if not any(pat.lower() in (m.source or "").lower() for pat in exclude_source_patterns)
+            ]
+            logger.info(
+                "RAG exclude_source_patterns %s removed %d/%d candidates",
+                exclude_source_patterns, before - len(candidates), before,
+            )
+
+        if not candidates:
+            return []
+
+        combined_query = " ; ".join(str(query).strip() for query in queries if str(query).strip())
+        return self._rerank_matches(
+            combined_query,
+            candidates,
+            top_n=int(top_k or self.top_k),
+        )
+
+    def format_matches(self, matches: list[PineconeMatch], max_chars: int | None = None) -> str:
+        if not matches:
+            return f"No Pinecone matches. Retriever status: {self.status()}"
+
+        max_chars = int(max_chars or self.format_max_chars)
+        parts = []
+        total_chars = 0
+        for idx, match in enumerate(matches, start=1):
+            header = f"[{idx}] {match.title or match.match_id}"
+            if match.source:
+                header += f" | {match.source}"
+
+            tags = self._format_metadata_tags(match.metadata or {})
+            prefix = f"{header}\nScore: {match.score:.3f}\n"
+            if tags:
+                prefix += f"Tags: {tags}\n"
+            remaining = max_chars - total_chars
+            if remaining <= len(prefix):
+                break
+
+            body_budget = min(remaining - len(prefix), self.match_max_chars)
+            body = self._truncate_text(match.text.strip().replace("\r", ""), body_budget)
+            if not body:
+                continue
+
+            block = f"{prefix}```cuda\n{body}\n```"
+            parts.append(block)
+            total_chars += len(block)
+
+        return "\n\n".join(parts)
+
+    def get_top_k(self, query: str, k: int = 1):
+        return [match.to_legacy_dict() for match in self.search(query, top_k=k)]
+
