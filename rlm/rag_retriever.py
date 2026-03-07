@@ -356,3 +356,65 @@ class PineconeRetriever:
     def get_top_k(self, query: str, k: int = 1):
         return [match.to_legacy_dict() for match in self.search(query, top_k=k)]
 
+    def _search_by_vector(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        metadata_filter: dict | None = None,
+        exclude_source_patterns: list[str] | None = None,
+    ) -> list[PineconeMatch]:
+        index = self._ensure_index()
+        if index is None:
+            return []
+
+        try:
+            vector = embed_query(
+                text=query.strip(),
+                provider=self.embed_provider,
+                model_name=self.embed_model,
+            )
+        except Exception as exc:  # pragma: no cover - optional dependency/runtime
+            logger.warning("Query embedding failed for %r: %s", query, exc)
+            self.last_query_mode = "vector_error"
+            return []
+
+        try:
+            response = index.query(
+                vector=vector,
+                top_k=int(top_k or self.top_k),
+                namespace=namespace or self.namespace or "__default__",
+                include_metadata=True,
+                include_values=False,
+                filter=metadata_filter if metadata_filter is not None else self.default_filter,
+            )
+            self.last_query_mode = f"vector:{self.embed_model}"
+        except Exception as exc:  # pragma: no cover - network runtime
+            logger.warning("Pinecone vector query failed for %r: %s", query, exc)
+            self.last_query_mode = "vector_error"
+            return []
+
+        hits = self._extract_hits(response)
+        matches = []
+        for hit in hits:
+            metadata = hit.get("metadata", {}) or {}
+            source = self._extract_source(fields={}, metadata=metadata)
+            if exclude_source_patterns and any(
+                pat.lower() in source.lower() for pat in exclude_source_patterns
+            ):
+                continue
+            text = self._extract_text(fields={}, metadata=metadata)
+            if not text:
+                continue
+            matches.append(
+                PineconeMatch(
+                    match_id=str(hit.get("_id") or hit.get("id") or "unknown"),
+                    score=float(hit.get("_score") or hit.get("score") or 0.0),
+                    text=text,
+                    title=self._extract_title(fields={}, metadata=metadata, hit=hit),
+                    source=source,
+                    metadata=metadata,
+                )
+            )
+        return self._rerank_matches(query, matches, top_n=int(top_k or self.top_k))
+
