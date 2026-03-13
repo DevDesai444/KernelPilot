@@ -418,3 +418,68 @@ class PineconeRetriever:
             )
         return self._rerank_matches(query, matches, top_n=int(top_k or self.top_k))
 
+    def _extract_text(self, fields: dict, metadata: dict) -> str:
+        for key in self._text_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _extract_title(self, fields: dict, metadata: dict, hit: dict) -> str:
+        for key in self._title_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return str(hit.get("_id") or hit.get("id") or "").strip()
+
+    def _extract_source(self, fields: dict, metadata: dict) -> str:
+        for key in self._source_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _text_candidates(self) -> list[str]:
+        return [
+            self.text_field,
+            "source_code",
+            "chunk_text",
+            "text",
+            "content",
+            "body",
+            "code",
+        ]
+
+    def _title_candidates(self) -> list[str]:
+        return [
+            self.title_field,
+            "title",
+            "source_file",
+            "op_type",
+            "optimization_pattern",
+        ]
+
+    def _source_candidates(self) -> list[str]:
+        return [
+            self.source_field,
+            "source",
+            "source_file",
+        ]
+
+    def _format_metadata_tags(self, metadata: dict) -> str:
+        tags = []
+        for key in ("hardware_target", "op_type", "optimization_pattern"):
+            value = metadata.get(key)
+            if value:
+                tags.append(f"{key}={value}")
+        return ", ".join(tags[:3])
+
+    def _truncate_text(self, text: str, max_len: int) -> str:
+        if max_len <= 0:
+            return ""
+        if len(text) <= max_len:
+            return text
+        if max_len <= 3:
+            return text[:max_len]
+        return text[: max_len - 3].rstrip() + "..."
+
