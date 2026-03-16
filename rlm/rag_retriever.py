@@ -483,3 +483,47 @@ class PineconeRetriever:
             return text[:max_len]
         return text[: max_len - 3].rstrip() + "..."
 
+    def _rerank_matches(
+        self,
+        query: str,
+        matches: list[PineconeMatch],
+        top_n: int,
+    ) -> list[PineconeMatch]:
+        if not matches:
+            return []
+
+        reranked = self._pinecone_rerank(query, matches, top_n=top_n)
+        if reranked is not None:
+            logger.info(
+                "RAG FULL RANKING (%d candidates → top %d) for query %r:",
+                len(matches), top_n, query[:80],
+            )
+            for rank, m in enumerate(reranked, start=1):
+                flag = " ← RETURNED" if rank <= top_n else ""
+                logger.info(
+                    "  [%2d] score=%.4f  %-50s  %s%s",
+                    rank, m.score, (m.title or m.match_id)[:50], m.source[:40] if m.source else "", flag,
+                )
+            return reranked
+
+        scored = sorted(
+            matches,
+            key=lambda match: self._heuristic_rank_score(query, match),
+            reverse=True,
+        )
+        logger.info(
+            "RAG HEURISTIC RANKING (%d candidates → top %d) for query %r:",
+            len(scored), top_n, query[:80],
+        )
+        for rank, m in enumerate(scored, start=1):
+            flag = " ← RETURNED" if rank <= top_n else ""
+            logger.info(
+                "  [%2d] score=%.4f  %-50s  %s%s",
+                rank, self._heuristic_rank_score(query, m), (m.title or m.match_id)[:50],
+                m.source[:40] if m.source else "", flag,
+            )
+        scored = self._diversify_matches(scored, top_n=top_n)
+        if self.last_query_mode != "uninitialized" and "+heuristic" not in self.last_query_mode:
+            self.last_query_mode = f"{self.last_query_mode}+heuristic+diverse"
+        return scored[:top_n]
+
