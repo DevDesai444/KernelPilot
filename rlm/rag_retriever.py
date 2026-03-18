@@ -527,3 +527,111 @@ class PineconeRetriever:
             self.last_query_mode = f"{self.last_query_mode}+heuristic+diverse"
         return scored[:top_n]
 
+    def _pinecone_rerank(
+        self,
+        query: str,
+        matches: list[PineconeMatch],
+        top_n: int,
+    ) -> list[PineconeMatch] | None:
+        if not self.rerank_model or self._client is None:
+            return None
+        inference = getattr(self._client, "inference", None)
+        if inference is None or not hasattr(inference, "rerank"):
+            return None
+
+        documents = []
+        pool = matches  # pass ALL deduplicated candidates to reranker, not just rerank_pool
+        for match in pool:
+            metadata = match.metadata or {}
+            combined_text = "\n".join(
+                part
+                for part in (
+                    match.text,
+                    f"title: {match.title}" if match.title else "",
+                    f"source: {match.source}" if match.source else "",
+                    f"hardware_target: {metadata.get('hardware_target')}" if metadata.get("hardware_target") else "",
+                    f"op_type: {metadata.get('op_type')}" if metadata.get("op_type") else "",
+                    (
+                        f"optimization_pattern: {metadata.get('optimization_pattern')}"
+                        if metadata.get("optimization_pattern")
+                        else ""
+                    ),
+                )
+                if part
+            )
+            documents.append(
+                {
+                    "id": match.match_id,
+                    "text": combined_text,
+                    "title": match.title,
+                    "source": match.source,
+                    "hardware_target": str(metadata.get("hardware_target") or ""),
+                    "op_type": str(metadata.get("op_type") or ""),
+                    "optimization_pattern": str(metadata.get("optimization_pattern") or ""),
+                }
+            )
+
+        try:
+            result = inference.rerank(
+                model=self.rerank_model,
+                query=query,
+                documents=documents,
+                top_n=len(documents),  # fetch ALL so we can log full ranking
+                return_documents=True,
+                rank_fields=["text"],
+                parameters={"truncate": "END"},
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime behavior
+            logger.warning("Pinecone rerank failed for query %r: %s", query, exc)
+            return None
+
+        data = getattr(result, "data", None)
+        if data is None and hasattr(result, "to_dict"):
+            try:
+                data = result.to_dict().get("data")
+            except Exception:
+                data = None
+        if not data:
+            return None
+
+        ranked = []
+        for item in data:
+            if not isinstance(item, dict) and hasattr(item, "to_dict"):
+                item = item.to_dict()
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index")
+            if index is None or index >= len(pool):
+                continue
+            base = pool[index]
+            ranked.append(
+                PineconeMatch(
+                    match_id=base.match_id,
+                    score=float(item.get("score") or base.score),
+                    text=base.text,
+                    title=base.title,
+                    source=base.source,
+                    metadata=base.metadata,
+                )
+            )
+
+        if not ranked:
+            return None
+
+        # Log full ranking so we can inspect what's below the cut
+        logger.info(
+            "RAG PINECONE RERANK: %d candidates, returning top %d. Query: %r",
+            len(ranked), top_n, query[:80],
+        )
+        for rank, m in enumerate(ranked, start=1):
+            flag = " ← RETURNED" if rank <= top_n else ""
+            logger.info(
+                "  [%2d] rerank_score=%.4f  %-50s  %s%s",
+                rank, m.score, (m.title or m.match_id)[:50], m.source[:40] if m.source else "", flag,
+            )
+
+        ranked = self._diversify_matches(ranked, top_n=top_n)
+        if ranked and self.last_query_mode != "uninitialized":
+            self.last_query_mode = f"{self.last_query_mode}+rerank:{self.rerank_model}+diverse"
+        return ranked
+
