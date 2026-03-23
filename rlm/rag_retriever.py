@@ -782,3 +782,41 @@ class PineconeRetriever:
             and any(term in query_norm for term in ("add", "residual"))
         )
 
+    def _diversify_matches(self, matches: list[PineconeMatch], top_n: int) -> list[PineconeMatch]:
+        selected = []
+        seen_prefixes = set()
+        source_counts = {}
+
+        for match in matches:
+            prefix_key = self._code_prefix_hash(match)
+            if prefix_key and prefix_key in seen_prefixes:
+                continue
+
+            source_key = self._normalize_text(match.source or "unknown").strip() or "unknown"
+            if source_counts.get(source_key, 0) >= self.source_cap:
+                continue
+
+            selected.append(match)
+            if prefix_key:
+                seen_prefixes.add(prefix_key)
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
+            if len(selected) >= top_n:
+                return selected
+
+        if len(selected) >= top_n:
+            return selected
+
+        selected_ids = {item.match_id for item in selected}
+        for match in matches:
+            if match.match_id in selected_ids:
+                continue
+            prefix_key = self._code_prefix_hash(match)
+            if prefix_key and prefix_key in seen_prefixes:
+                continue
+            selected.append(match)
+            if prefix_key:
+                seen_prefixes.add(prefix_key)
+            if len(selected) >= top_n:
+                break
+        return selected
+
