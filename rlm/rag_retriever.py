@@ -820,3 +820,69 @@ class PineconeRetriever:
                 break
         return selected
 
+    def _code_prefix_hash(self, match: PineconeMatch) -> str:
+        body = self._strip_comments(match.text)
+        if not body:
+            return ""
+        prefix = body[:200].strip()
+        if not prefix:
+            return ""
+        return hashlib.sha1(prefix.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _strip_comments(self, text: str) -> str:
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        text = re.sub(r"//.*", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _source_weight_bonus(self, source: str) -> float:
+        key = self._normalize_text(source).strip()
+        if not key:
+            return 0.0
+        weight = SOURCE_QUALITY_WEIGHTS.get(key, 0.8)
+        return (weight - 0.8) * 0.75
+
+    def _candidate_text(self, match: PineconeMatch) -> str:
+        metadata = match.metadata or {}
+        parts = [
+            match.title,
+            match.source,
+            metadata.get("source_file", ""),
+            metadata.get("hardware_target", ""),
+            metadata.get("op_type", ""),
+            metadata.get("optimization_pattern", ""),
+            match.text[:1600],
+        ]
+        return self._normalize_text(" ".join(str(part) for part in parts if part))
+
+    def _normalize_text(self, text: str) -> str:
+        text = str(text).lower().replace("_", " ").replace("-", " ")
+        return re.sub(r"[^a-z0-9+]+", " ", text)
+
+    def _extract_hits(self, response) -> list[dict]:
+        # Plain vector query response: .matches is a non-empty list of ScoredVector.
+        # Only enter this branch when matches is actually populated — SearchRecordsResponse
+        # may have a .matches attribute that is None/empty even when result.hits has data.
+        matches_val = getattr(response, "matches", None)
+        if matches_val:
+            return [self._normalize_hit(hit) for hit in matches_val]
+
+        if isinstance(response, dict):
+            result = response.get("result", response)
+            hits = result.get("hits") or result.get("matches") or []
+            return [self._normalize_hit(hit) for hit in hits]
+
+        # Integrated inference response: try response.result.hits first,
+        # then response.hits directly as a fallback
+        result = getattr(response, "result", None)
+        if result is not None:
+            if isinstance(result, dict):
+                hits = result.get("hits") or result.get("matches") or []
+            else:
+                hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
+        else:
+            hits = getattr(response, "hits", None) or getattr(response, "matches", None) or []
+        if not hits:
+            logger.info("_extract_hits: empty hits. response type=%s repr=%.400s",
+                        type(response).__name__, repr(response))
+        return [self._normalize_hit(hit) for hit in hits]
+
