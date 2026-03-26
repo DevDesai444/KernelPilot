@@ -886,3 +886,50 @@ class PineconeRetriever:
                         type(response).__name__, repr(response))
         return [self._normalize_hit(hit) for hit in hits]
 
+    def _normalize_hit(self, hit) -> dict:
+        if isinstance(hit, dict):
+            return hit
+
+        output = {}
+        for key in ("_id", "id", "_score", "score", "fields", "metadata"):
+            value = getattr(hit, key, None)
+            if value is not None:
+                output[key] = value
+        if hasattr(hit, "to_dict"):
+            try:
+                output.update(hit.to_dict())
+            except Exception:
+                pass
+        return output
+
+    def _is_integrated_inference_error(self, exc: Exception) -> bool:
+        return "integrated inference is not configured for this index" in str(exc).lower()
+
+
+def init_knowledge_base(config: dict | None = None) -> PineconeRetriever:
+    return PineconeRetriever(config=config)
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    output = []
+    for item in items:
+        cleaned = " ".join(str(item).split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(cleaned)
+    return output
+
+
+if __name__ == "__main__":
+    retriever = init_knowledge_base()
+    demo_queries = [
+        "Blackwell CUDA vectorized stores",
+        "warp reduction bf16 kernel",
+    ]
+    print(json.dumps({"status": retriever.status(), "queries": demo_queries}, indent=2))
+    print(retriever.format_matches(retriever.search_many(demo_queries)))
