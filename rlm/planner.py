@@ -78,3 +78,59 @@ def fallback_branches(
     return branches
 
 
+def parse_plan_response(
+    text: str,
+    count: int,
+    prefix: str,
+    parent_strategy: str = "",
+) -> list[dict]:
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        return fallback_branches(count, prefix, parent_strategy=parent_strategy)
+
+    try:
+        raw = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return fallback_branches(count, prefix, parent_strategy=parent_strategy)
+
+    branches = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or f"{prefix}_{idx + 1}").strip()
+        change_summary = str(
+            item.get("change_summary")
+            or item.get("what")
+            or item.get("goal")
+            or "Implement one targeted optimization."
+        ).strip()
+        branches.append(
+            PlanBranch(
+                name=name,
+                goal=str(item.get("goal") or change_summary).strip(),
+                bottleneck=str(item.get("bottleneck") or "").strip(),
+                change_summary=change_summary,
+                expected_signal=str(
+                    item.get("expected_signal")
+                    or "Sandbox metrics should show a clear change."
+                ).strip(),
+                rag_queries=_coerce_string_list(item.get("rag_queries")),
+                planner_notes=str(
+                    item.get("planner_notes") or item.get("notes") or ""
+                ).strip(),
+                rationale=str(item.get("rationale") or "").strip(),
+                risk=str(item.get("risk") or "").strip(),
+                evidence=_coerce_string_list(item.get("evidence")),
+                parent_strategy=str(
+                    item.get("parent_strategy") or parent_strategy
+                ).strip(),
+                tree_ready=bool(item.get("tree_ready", bool(parent_strategy))),
+            ).to_dict()
+        )
+
+    if not branches:
+        return fallback_branches(count, prefix, parent_strategy=parent_strategy)
+
+    return branches[:count]
+
+
