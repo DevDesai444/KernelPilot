@@ -134,3 +134,74 @@ def parse_plan_response(
     return branches[:count]
 
 
+def _render_planner_prompt(spec: PlannerSpec) -> str:
+    branch_example = {
+        "name": "short_branch_name",
+        "goal": "what retrieved code pattern this branch is trying to adapt",
+        "bottleneck": "optional short observed concern only if strongly evidenced",
+        "change_summary": "the concrete retrieved pattern or local adaptation for the coder agent",
+        "expected_signal": "which sandbox result would validate the adaptation",
+        "rag_queries": ["query 1", "query 2"],
+        "planner_notes": "short constraint or preserve rule",
+        "rationale": "why this branch is worth trying now",
+        "risk": "main failure mode to avoid",
+        "evidence": ["one short clue from spec or RAG"],
+        "tree_ready": spec.mode == "tree",
+    }
+    if spec.parent_strategy:
+        branch_example["parent_strategy"] = spec.parent_strategy
+
+    mode_rules = [
+        "Use the INPUT_SPEC as the source of truth for the task and constraints.",
+        "Use the Pinecone RAG context to name concrete implementation patterns or reference kernels.",
+        "Prefer branches that adapt retrieved production code over branches that speculate about bottlenecks.",
+        "At least one root branch must be a closest-source adaptation branch that copies the most relevant retrieved kernel structure as faithfully as possible.",
+        "If the RAG context already contains a strong production pattern, branch around minimal adaptations of that pattern.",
+        "Assume the coder will only implement the branch you output; make the adaptation scope explicit and narrow.",
+        "Each branch must be distinct and testable in one sandbox iteration.",
+        "Do not let GEMM or matmul kernels dominate planning for fused add/rmsnorm/quantize tasks unless the retrieved code clearly matches the target operation.",
+        "Do not write CUDA code.",
+        "No prose outside the JSON array.",
+    ]
+    if spec.mode == "tree":
+        mode_rules.extend(
+            [
+                "Do not propose full rewrites.",
+                "Preserve the parent branch's working structure.",
+                "Each child branch must be a different minimal follow-up adaptation of the best working family.",
+            ]
+        )
+    else:
+        mode_rules.extend(
+            [
+                "Prefer measurable first-step branches over sweeping redesigns.",
+                "Spread branches across different optimization surfaces when possible.",
+            ]
+        )
+    rules_block = "\n- ".join(mode_rules)
+
+    return f"""\
+You are the planner agent for a CUDA kernel optimizer.
+Produce execution branches only.
+
+INPUT_SPEC (JSON):
+{spec.to_prompt_json()}
+
+Pinecone RAG context:
+{spec.rag_context or "No Pinecone context returned."}
+
+Reference kernel:
+```cuda
+{spec.kernel_src}
+```
+
+Return ONLY a JSON array with exactly {spec.branch_count} objects in this schema:
+[
+  {json.dumps(branch_example, indent=2)}
+]
+
+Rules:
+- {rules_block}
+"""
+
+
