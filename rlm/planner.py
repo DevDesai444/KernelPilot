@@ -205,3 +205,51 @@ Rules:
 """
 
 
+def build_initial_plan_prompt(
+    kernel_type: str,
+    operation: str,
+    aliases: list[str],
+    problem_shape: tuple,
+    kernel_src: str,
+    baseline_context: str,
+    rag_context: str,
+    branch_count: int,
+) -> str:
+    spec = build_root_planner_spec(
+        kernel_type=kernel_type,
+        operation=operation,
+        aliases=aliases,
+        problem_shape=problem_shape,
+        kernel_src=kernel_src,
+        baseline_context=baseline_context,
+        rag_context=rag_context,
+        branch_count=branch_count,
+    )
+    return _render_planner_prompt(spec)
+
+
+def build_tree_plan_prompt(
+    kernel_type: str,
+    operation: str,
+    aliases: list[str],
+    problem_shape: tuple,
+    parent_strategy: str,
+    parent_speedup: float,
+    kernel_src: str,
+    feedback_summary: str,
+    rag_context: str,
+    branch_count: int,
+) -> str:
+    spec = build_tree_planner_spec(
+        kernel_type=kernel_type,
+        operation=operation,
+        aliases=aliases,
+        problem_shape=problem_shape,
+        kernel_src=kernel_src,
+        feedback_summary=feedback_summary,
+        rag_context=rag_context,
+        branch_count=branch_count,
+        parent_strategy=parent_strategy,
+        parent_speedup=parent_speedup,
+    )
+    return _render_planner_prompt(spec)
