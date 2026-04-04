@@ -247,3 +247,65 @@ class RLMEngine:
 
     # ── Low-level LLM call ────────────────────────────────────────────────────
 
+    def _call_llm(
+        self,
+        prompt: str,
+        model: str,
+        system: str = SYSTEM_PROMPT,
+        temperature: float = 0.3,
+    ) -> tuple:
+        if self.env.over_budget():
+            raise RuntimeError(
+                f"Budget exhausted: ${self.env.total_api_cost_usd:.4f} spent"
+            )
+
+        response = self.client.messages.create(
+            model=model,
+            max_tokens=self.max_tokens,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text       = response.content[0].text
+        tokens_in  = response.usage.input_tokens
+        tokens_out = response.usage.output_tokens
+        cost = self.env.record_api_cost(tokens_in, tokens_out, model)
+        logger.info(
+            "LLM call: model=%s in=%d out=%d cost=$%.4f",
+            model, tokens_in, tokens_out, cost,
+        )
+        return text, tokens_in, tokens_out
+
+    async def _call_llm_async(
+        self,
+        prompt: str,
+        model: str,
+        system: str = SYSTEM_PROMPT,
+        temperature: float = 0.3,
+    ) -> tuple:
+        """True async API call — all 4 beam coroutines run concurrently."""
+        if self.env.over_budget():
+            raise RuntimeError(
+                f"Budget exhausted: ${self.env.total_api_cost_usd:.4f} spent"
+            )
+
+        async with self._api_semaphore:
+            response = await self.async_client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+        text       = response.content[0].text
+        tokens_in  = response.usage.input_tokens
+        tokens_out = response.usage.output_tokens
+        cost = self.env.record_api_cost(tokens_in, tokens_out, model)
+        logger.info(
+            "LLM call (async): model=%s in=%d out=%d cost=$%.4f",
+            model, tokens_in, tokens_out, cost,
+        )
+        return text, tokens_in, tokens_out
+
