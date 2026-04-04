@@ -180,3 +180,70 @@ Rules:
 - Do not use torch headers (torch/extension.h, ATen, c10).
 """
 
+def _build_refine_system_prompt(
+    speedup: float,
+    prev_metrics: dict = None,
+    kernel_type: str = "",
+    problem_shape: tuple | None = None,
+) -> str:
+    """Build REFINE_SYSTEM_PROMPT with constraints from measured runtime data."""
+    if speedup >= 1.0 and prev_metrics:
+        cm = prev_metrics.get("_compiler", {})
+        occupancy = float(prev_metrics.get("sm_occupancy", 0) or 0.0)
+        hints = []
+        if cm.get("spill_stores_bytes", 0) or cm.get("spill_loads_bytes", 0):
+            hints.append("spills are present, so reduce live state before adding more work per thread")
+        regs = int(cm.get("registers_per_thread", 0) or 0)
+        reg_limit = 96
+        occ_limit = 75.0
+        if kernel_type == "add_rmsnorm" and tuple(problem_shape or ()) == (128, 2048):
+            reg_limit = 44   # baseline is 40; flag if candidate exceeds baseline+4
+            occ_limit = 74.0  # flag if occupancy drops below current baseline of 75%
+        elif kernel_type == "add_rmsnorm":
+            reg_limit = 44
+            occ_limit = 74.0
+        if regs >= reg_limit or occupancy < occ_limit:
+            hints.append("register pressure or occupancy is already tight")
+
+        constraint = f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical follow-up changes over structural rewrites."
+        if hints:
+            constraint += "\n- Measured constraints: " + "; ".join(hints) + "."
+    else:
+        constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
+
+    return REFINE_SYSTEM_PROMPT.replace("{{turns}}", str(MAX_INNER_TURNS)).replace("{{constraint}}", constraint)
+
+
+class RLMEngine:
+    """
+    Main orchestrator for the RLM beam search loop.
+    Handles: decomposition → beam generation → profiler-guided refinement → combination.
+    """
+
+    def __init__(self, env: RLMEnvironment):
+        self.env = env
+        cfg = env.search_config
+        self.beam_width    = cfg["beam"]["width"]
+        self.refine_rounds = cfg["beam"]["refine_rounds"]
+        # Sync client for root/combine calls (sequential); async client for parallel beams
+        self.client       = anthropic.Anthropic()
+        self.async_client = AsyncAnthropic(max_retries=10)
+        max_concurrent_api_calls = int(
+            cfg["beam"].get("max_concurrent_api_calls", max(2, min(self.beam_width, 4)))
+        )
+        # Limit concurrent API calls to avoid 429s without artificially serializing the beam.
+        self._api_semaphore = asyncio.Semaphore(max(1, max_concurrent_api_calls))
+        self._loop = None  # persistent event loop for async calls
+
+        self.root_model    = cfg["models"].get("planner_model", cfg["models"]["root_model"])
+        self.sub_model     = cfg["models"].get("coder_model", cfg["models"]["sub_model"])
+        self.fixer_model   = cfg["models"].get("fixer_model", cfg["models"]["sub_model"])
+        self.combine_model = cfg["models"]["combine_model"]
+        self.combine_top_k = cfg["beam"]["combine_top_k"]
+        self.tree_speedup_threshold = float(cfg["beam"].get("tree_speedup_threshold", 1.0))
+        self.tree_branching_factor = int(cfg["beam"].get("tree_branching_factor", 2))
+        self.max_tokens    = cfg["cost_control"]["max_tokens_per_sub_call"]
+        self.rag = init_knowledge_base(cfg.get("rag", {}))
+
+    # ── Low-level LLM call ────────────────────────────────────────────────────
+
