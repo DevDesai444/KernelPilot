@@ -463,3 +463,44 @@ class RLMEngine:
 
     # ── Round 0: Decomposition ────────────────────────────────────────────────
 
+    def decompose(self) -> list:
+        env = self.env
+        num_strategies = self.beam_width * 2
+        planner_queries = self._initial_plan_queries()
+        rag_context = self._search_pinecone_context(planner_queries)
+        self._log_planner_block(
+            f"PLANNER RAG CONTEXT [root] queries={planner_queries}",
+            rag_context,
+        )
+        prompt = build_initial_plan_prompt(
+            kernel_type=env.kernel_type,
+            operation=_kernel_operation_phrase(env.kernel_type),
+            aliases=_kernel_aliases(env.kernel_type),
+            problem_shape=env.problem_shapes[0],
+            kernel_src=env.kernel_src,
+            baseline_context=self._planner_baseline_context(),
+            rag_context=rag_context,
+            branch_count=num_strategies,
+        )
+
+        logger.info("Planner: generating %d root branches for %s", num_strategies, env.kernel_type)
+        response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
+        self._log_planner_block("PLANNER RAW OUTPUT [root]", response)
+        strategies = parse_plan_response(
+            response,
+            count=num_strategies,
+            prefix="root_plan",
+        )
+        self._log_planner_block(
+            "PLANNER PARSED BRANCHES [root]",
+            json.dumps(strategies, indent=2, sort_keys=True),
+        )
+        if strategies:
+            logger.info("Planner produced %d branches", len(strategies))
+            return strategies
+
+        logger.warning("Planner returned no usable branches, using fallback plans")
+        return fallback_branches(num_strategies, prefix="root_plan")
+
+    # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
+
