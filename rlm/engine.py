@@ -309,3 +309,67 @@ class RLMEngine:
         )
         return text, tokens_in, tokens_out
 
+    async def _call_llm_with_tools_async(
+        self,
+        messages: list,
+        tools: list,
+        model: str,
+        system: str = SYSTEM_PROMPT,
+        temperature: float = 0.4,
+    ):
+        """Async API call with tool use support. Returns full response object."""
+        if self.env.over_budget():
+            raise RuntimeError(
+                f"Budget exhausted: ${self.env.total_api_cost_usd:.4f} spent"
+            )
+
+        async with self._api_semaphore:
+            response = await self.async_client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
+
+        tokens_in  = response.usage.input_tokens
+        tokens_out = response.usage.output_tokens
+        cost = self.env.record_api_cost(tokens_in, tokens_out, model)
+        logger.info(
+            "LLM tool call: model=%s in=%d out=%d cost=$%.4f stop=%s",
+            model, tokens_in, tokens_out, cost, response.stop_reason,
+        )
+        return response
+
+    def _planner_baseline_context(self) -> str:
+        env = self.env
+        ops = env.count_memory_ops()
+        missing = env.detect_missing_optimizations()
+        analysis = (
+            f"  Source signals: loads={ops['loads']} stores={ops['stores']} "
+            f"float4={ops['float4']} tma={ops['tma']} "
+            f"syncthreads~={ops['syncthreads']} (src={ops['syncthreads_source']}) "
+            f"shfl={ops['shfl']}\n"
+            f"  Preferred search surfaces: {', '.join(missing[:5]) if missing else 'none singled out from source analysis'}\n"
+        )
+        if env.baseline_naive_us and env.baseline_us_reported:
+            rows = env.problem_shapes[0][0]
+            sm_count = env.hw_spec.get("sm", {}).get("count", 148)
+            cm = env.baseline_compiler_metrics
+            cm_str = cm.summary_str() if cm else "unavailable"
+            baseline_label = "FlashInfer timing" if env.official_baseline else "Reference fallback timing (UNOFFICIAL)"
+            return (
+                f"BASELINE PROFILER DATA (reference kernel):\n"
+                f"  Naive kernel timing: {env.baseline_naive_us:.3f} us\n"
+                f"  {baseline_label}:   {env.baseline_us_reported:.3f} us\n"
+                f"  Compiler: {cm_str}\n"
+                f"  Grid: {rows} blocks launched on {sm_count} SMs"
+                f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
+                f"{analysis}"
+            )
+        return (
+            "BASELINE PROFILER DATA: unavailable — analyze kernel source and retrieved production patterns.\n"
+            f"{analysis}"
+        )
+
