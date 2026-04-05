@@ -373,3 +373,93 @@ class RLMEngine:
             f"{analysis}"
         )
 
+    def _search_pinecone_context(self, queries: list[str], top_k: int | None = None) -> str:
+        clean_queries = [q.strip() for q in queries if q and q.strip()]
+        if not clean_queries:
+            return "No Pinecone query provided."
+        effective_top_k = int(top_k or getattr(self.rag, "top_k", 4))
+        # For add_rmsnorm, exclude flashinfer (circular — it IS the baseline) and sakana
+        # (synthetic competition data, not production CUDA). Forces vllm/sglang/apex/cutlass.
+        exclude = ["flashinfer", "sakana"] if getattr(self.env, "kernel_type", "") == "add_rmsnorm" else []
+        matches = self.rag.search_many(clean_queries[:4], top_k=effective_top_k,
+                                       exclude_source_patterns=exclude or None)
+        return self.rag.format_matches(matches)
+
+    def _log_planner_block(self, title: str, content: str) -> None:
+        text = content.strip() if content else "(empty)"
+        logger.info("\n%s\n%s\n%s", "=" * 80, title, "=" * 80)
+        logger.info("%s", text)
+
+    def _initial_plan_queries(self) -> list[str]:
+        env = self.env
+        shape = "x".join(str(dim) for dim in env.problem_shapes[0])
+        operation = _kernel_operation_phrase(env.kernel_type)
+        aliases = ", ".join(_kernel_aliases(env.kernel_type)[:4])
+        queries = [
+            (
+                f"Operation: {operation}. "
+                f"Shape: {shape}. Aliases: {aliases}. Need: production CUDA kernel source_code."
+            ),
+            f"{operation} FlashInfer production kernel source code",
+            f"{operation} best production kernel B200 bf16 fp4 source code",
+            f"{operation} vectorized loads stores bf16 fp4 CUDA source code",
+        ]
+        for hint in env.detect_missing_optimizations()[:2]:
+            queries.append(f"{operation} {hint.replace('_', ' ')} CUDA source code")
+        return queries
+
+    def _expand_tree_plans(self, parent: KernelCandidate, branch_count: int | None = None) -> list[dict]:
+        branch_count = int(branch_count or self.tree_branching_factor)
+        planner_queries = (
+            parent.plan_branch.get("rag_queries")
+            or [f"{self.env.kernel_type} {parent.strategy} next optimization"]
+        )
+        rag_context = self._search_pinecone_context(planner_queries)
+        feedback = build_sandbox_feedback(
+            {
+                "compile_ok": parent.compile_ok,
+                "correct": parent.correct,
+                "speedup": parent.speedup,
+                "metrics": parent.metrics,
+                "error": parent.compile_error,
+            },
+            parent_speedup=parent.speedup,
+            prev_inner_metrics=parent.prev_metrics,
+            kernel_type=self.env.kernel_type,
+            candidate=parent,
+        )
+        self._log_planner_block(
+            f"PLANNER RAG CONTEXT [tree parent={parent.strategy}] queries={planner_queries}",
+            rag_context,
+        )
+        prompt = build_tree_plan_prompt(
+            kernel_type=self.env.kernel_type,
+            operation=_kernel_operation_phrase(self.env.kernel_type),
+            aliases=_kernel_aliases(self.env.kernel_type),
+            problem_shape=self.env.problem_shapes[0],
+            parent_strategy=parent.strategy,
+            parent_speedup=parent.speedup,
+            kernel_src=parent.best_code or parent.code,
+            feedback_summary=feedback.planner_summary(),
+            rag_context=rag_context,
+            branch_count=branch_count,
+        )
+        response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
+        self._log_planner_block(
+            f"PLANNER RAW OUTPUT [tree parent={parent.strategy}]",
+            response,
+        )
+        branches = parse_plan_response(
+            response,
+            count=branch_count,
+            prefix=f"{parent.strategy}_child",
+            parent_strategy=parent.strategy,
+        )
+        self._log_planner_block(
+            f"PLANNER PARSED BRANCHES [tree parent={parent.strategy}]",
+            json.dumps(branches, indent=2, sort_keys=True),
+        )
+        return branches
+
+    # ── Round 0: Decomposition ────────────────────────────────────────────────
+
