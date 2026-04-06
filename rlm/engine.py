@@ -681,3 +681,134 @@ class RLMEngine:
         failed.strategy_context = strategy_context
         return failed
 
+    async def _generate_single_beam(
+        self,
+        strategy,
+        kernel_slice: str,
+        current_metrics: dict = None,
+        round_num: int = 0,
+        profile_fn=None,
+    ) -> KernelCandidate:
+        if isinstance(strategy, dict):
+            plan_branch = dict(strategy)
+            strat_name = plan_branch.get("name", "unknown")
+            strat_desc = plan_branch.get("change_summary") or plan_branch.get("what", "")
+        else:
+            strat_name = str(strategy)
+            strat_desc = ""
+            plan_branch = {
+                "name": strat_name,
+                "goal": strat_name,
+                "what": strat_desc,
+                "change_summary": strat_desc,
+                "expected_signal": "Sandbox output improves.",
+                "rag_queries": [],
+            }
+
+        launch_sig = _get_launch_signature(self.env.kernel_type)
+
+        if profile_fn and strat_desc:
+            rag_context = self._search_pinecone_context(
+                plan_branch.get("rag_queries")
+                or [f"{self.env.kernel_type} {strat_name} CUDA optimization"]
+            )
+            current_profile = (
+                _format_profile_section(current_metrics, round_num)
+                if current_metrics else ""
+            )
+            _bcm = self.env.baseline_compiler_metrics
+            _baseline_regs = int(getattr(_bcm, "registers_per_thread", 0) or 0) if _bcm else 0
+            initial_prompt = build_coder_prompt(
+                plan_branch=plan_branch,
+                kernel_code=kernel_slice,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                current_profile=current_profile,
+                baseline_regs=_baseline_regs,
+            )
+            return await self._run_agent_loop(
+                initial_prompt=initial_prompt,
+                strategy_name=strat_name,
+                round_num=round_num,
+                profile_fn=profile_fn,
+                model_id=self.sub_model,
+                comparison_speedup=0.0,
+                prev_inner_metrics=current_metrics,
+                strategy_context=strat_desc,
+                plan_branch=plan_branch,
+            )
+
+        # ── One-shot fallback (no profile_fn or no description) ──────────
+        if strat_desc:
+            shape_str = str(self.env.problem_shapes[0])
+            prompt = f"""\
+You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
+
+Apply this optimization to the kernel below:
+
+## Optimization: {strat_name}
+{strat_desc}
+
+## Context
+Speedup is measured against FlashInfer, a production GPU library.
+You target ONE GPU (B200, sm_100a) and ONE shape ({shape_str}).
+
+## Naive reference kernel (starting point):
+```cuda
+{kernel_slice}
+```
+
+{launch_sig}
+
+CRITICAL RULES:
+1. Return the COMPLETE .cu file in a single ```cuda code block
+2. Keep all #includes (use the original #include directives, NOT the expanded content)
+3. Do NOT use torch headers (torch/extension.h, ATen, c10) — this is standalone CUDA
+4. Keep ALL kernel functions and the launch_* wrapper function
+5. The launch_* function signature MUST match the "Required Launch Function" section EXACTLY.
+   If you change it, you will get "undefined reference" linker errors.
+6. Output must match reference within atol=1e-2
+7. NEVER put __syncthreads() inside an if/else branch — all threads in a block MUST hit the same barrier or the kernel will deadlock.
+8. No explanations — just the code block
+9. You may call any function defined in the expanded headers above. Do NOT invent
+   helper functions that aren't defined in the headers.
+"""
+        else:
+            # No strategy description — use minimal prompt
+            prompt = f"""\
+You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
+
+Apply the "{strat_name}" optimization to this kernel:
+
+```cuda
+{kernel_slice}
+```
+
+{launch_sig}
+
+Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
+"""
+
+        try:
+            response, _, _ = await self._call_llm_async(
+                prompt, model=self.sub_model, temperature=0.6
+            )
+        except RuntimeError as e:
+            logger.error("Budget exceeded during beam %s: %s", strat_name, e)
+            return KernelCandidate(code="", strategy=strat_name, round_num=round_num)
+
+        code = self._extract_cuda_code(response)
+        if not code:
+            logger.warning("No CUDA code extracted for strategy=%s (response starts: %s)",
+                           strat_name, response[:100])
+        c = KernelCandidate(
+            code=code,
+            strategy=strat_name,
+            round_num=round_num,
+            compile_ok=bool(code),
+            branch_family=(plan_branch.get("parent_strategy") or plan_branch.get("name") or strat_name),
+            plan_branch=plan_branch,
+        )
+        c.strategy_context = strat_desc
+        return c
+
