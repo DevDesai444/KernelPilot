@@ -504,3 +504,180 @@ class RLMEngine:
 
     # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
 
+    async def _run_agent_loop(
+        self,
+        initial_prompt: str,
+        strategy_name: str,
+        round_num: int,
+        profile_fn,
+        model_id: str,
+        comparison_speedup: float = 0.0,
+        prev_inner_metrics: dict | None = None,
+        strategy_context: str = "",
+        plan_branch: dict | None = None,
+        parent_candidate: KernelCandidate | None = None,
+    ) -> KernelCandidate:
+        messages = [{"role": "user", "content": initial_prompt}]
+        best = None
+        last_error = ""
+        feedback_route = ""
+        submit_count = 0
+        max_api_turns = MAX_INNER_TURNS + 4
+        best_speedup = comparison_speedup
+        plan_branch = dict(plan_branch or {})
+
+        for turn in range(max_api_turns):
+            if submit_count >= MAX_INNER_TURNS:
+                break
+
+            system_prompt = _build_refine_system_prompt(
+                best_speedup,
+                prev_inner_metrics,
+                kernel_type=self.env.kernel_type,
+                problem_shape=self.env.problem_shapes[0],
+            )
+            try:
+                response = await self._call_llm_with_tools_async(
+                    messages=messages,
+                    tools=REFINE_TOOLS,
+                    model=model_id,
+                    system=system_prompt,
+                    temperature=0.4,
+                )
+            except RuntimeError as exc:
+                logger.error("Budget exceeded for %s turn %d: %s", strategy_name, turn, exc)
+                break
+
+            text_blocks = [
+                block.text for block in response.content
+                if hasattr(block, "text") and block.text.strip()
+            ]
+            if text_blocks:
+                logger.info(
+                    "\nAGENT [%s turn %d]:\n%s\n",
+                    strategy_name,
+                    turn,
+                    "\n".join(text_blocks),
+                )
+
+            messages.append({"role": "assistant", "content": response.content})
+
+            submit_code, submit_block_id, aux_results = self._handle_tool_calls(
+                response, messages, profile_fn, strategy_name, round_num,
+                max(best_speedup, comparison_speedup), prev_inner_metrics,
+            )
+
+            if submit_code is None and not submit_block_id:
+                has_any_tool = any(block.type == "tool_use" for block in response.content)
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
+                    continue
+                if not has_any_tool:
+                    break
+                continue
+
+            if submit_code is None:
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
+                continue
+
+            submit_count += 1
+            if profile_fn:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, profile_fn, submit_code, strategy_name, round_num
+                )
+            else:
+                result = {
+                    "compile_ok": False,
+                    "correct": False,
+                    "speedup": 0.0,
+                    "metrics": {},
+                    "error": "No profiler available",
+                    "branch_family": "unknown",
+                }
+
+            feedback = build_sandbox_feedback(
+                result=result,
+                parent_speedup=max(best_speedup, comparison_speedup),
+                prev_inner_metrics=prev_inner_metrics,
+                kernel_type=self.env.kernel_type,
+                candidate=best or parent_candidate,
+            )
+            feedback_route = feedback.route
+
+            if result["compile_ok"] and result["correct"] and result.get("metrics"):
+                prev_inner_metrics = result["metrics"]
+
+            all_results = list(aux_results) + [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": submit_block_id,
+                    "content": feedback.to_tool_result_json(),
+                }
+            ]
+            messages.append({"role": "user", "content": all_results})
+
+            logger.info(
+                "SANDBOX [%s submit %d]: route=%s speedup=%.3fx compile=%s correct=%s",
+                strategy_name,
+                submit_count,
+                feedback.route,
+                result.get("speedup", 0.0),
+                result.get("compile_ok"),
+                result.get("correct"),
+            )
+
+            if result["compile_ok"] and result["correct"]:
+                if best is None or result["speedup"] > best.speedup:
+                    best = KernelCandidate(
+                        code=submit_code,
+                        strategy=strategy_name,
+                        round_num=round_num,
+                        compile_ok=True,
+                        correct=True,
+                        speedup=result["speedup"],
+                        metrics=result.get("metrics", {}),
+                        bottleneck=result.get("branch_family") or result.get("bottleneck", "unknown"),
+                        prev_metrics=parent_candidate.metrics if parent_candidate else None,
+                        parent_strategy=(
+                            parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
+                        ),
+                        branch_family=(
+                            parent_candidate.branch_family
+                            if parent_candidate and parent_candidate.branch_family
+                            else (plan_branch.get("parent_strategy") or plan_branch.get("name") or strategy_name)
+                        ),
+                        plan_branch=dict(plan_branch),
+                        feedback_route=feedback.route,
+                    )
+                    best.strategy_context = strategy_context
+                    best.best_code = submit_code
+                    best.best_speedup = result["speedup"]
+                    best_speedup = result["speedup"]
+            else:
+                last_error = result.get("error", "") or feedback.uncertainty
+
+        if best:
+            return best
+
+        failed = KernelCandidate(
+            code="",
+            strategy=strategy_name,
+            round_num=round_num,
+            compile_ok=False,
+            prev_metrics=parent_candidate.metrics if parent_candidate else None,
+            parent_strategy=(
+                parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
+            ),
+            branch_family=(
+                parent_candidate.branch_family
+                if parent_candidate and parent_candidate.branch_family
+                else (plan_branch.get("parent_strategy") or plan_branch.get("name") or strategy_name)
+            ),
+            plan_branch=dict(plan_branch),
+            feedback_route=feedback_route,
+        )
+        failed.compile_error = last_error or "All inner refinement attempts failed"
+        failed.strategy_context = strategy_context
+        return failed
+
