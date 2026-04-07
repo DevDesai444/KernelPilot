@@ -915,3 +915,41 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                 refined.append(result)
         return refined
 
+    def _beam_exception_candidate(self, strategy, round_num: int, exc: Exception) -> KernelCandidate:
+        plan_branch = strategy if isinstance(strategy, dict) else {}
+        strategy_name = plan_branch.get("name") if isinstance(plan_branch, dict) else str(strategy)
+        family = (
+            plan_branch.get("parent_strategy")
+            or plan_branch.get("name")
+            or strategy_name
+        )
+        return KernelCandidate(
+            code="",
+            strategy=strategy_name or "beam_failed",
+            round_num=round_num,
+            compile_ok=False,
+            compile_error=f"Beam generation failed: {exc}",
+            branch_family=(family or "").split("__", 1)[0],
+            plan_branch=plan_branch,
+        )
+
+    def _refine_exception_candidate(
+        self,
+        parent: KernelCandidate,
+        round_num: int,
+        plan_branch: dict | None = None,
+    ) -> KernelCandidate:
+        plan_branch = dict(plan_branch or {})
+        branch_name = plan_branch.get("name", "refine_failed")
+        return KernelCandidate(
+            code=parent.best_code or parent.code,
+            strategy=f"{parent.strategy}__{branch_name}_r{round_num}",
+            round_num=round_num,
+            speedup=0.0,
+            compile_ok=False,
+            correct=False,
+            branch_family=parent.branch_family or parent.strategy.split("__", 1)[0],
+            parent_strategy=parent.strategy,
+            plan_branch=plan_branch,
+        )
+
