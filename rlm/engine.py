@@ -834,3 +834,84 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     # ── Refinement: multi-turn tool-use loop ─────────────────────────────────
 
+    async def refine_beams(self, survivors: list, round_num: int,
+                           profile_fn=None) -> list:
+        tasks = []
+        fallbacks = []
+        for candidate in survivors:
+            if candidate.compile_ok and candidate.correct:
+                branch_count = (
+                    self.tree_branching_factor
+                    if candidate.speedup >= self.tree_speedup_threshold
+                    and candidate.feedback_route == "planner_tree"
+                    else 1
+                )
+                followup_plans = self._expand_tree_plans(candidate, branch_count=branch_count)
+                for child_plan in followup_plans:
+                    fallbacks.append(
+                        self._refine_exception_candidate(candidate, round_num, child_plan)
+                    )
+                    tasks.append(
+                        self._refine_single_beam(
+                            candidate,
+                            round_num,
+                            profile_fn=profile_fn,
+                            plan_branch=child_plan,
+                            fixer_mode=False,
+                        )
+                    )
+            else:
+                feedback = build_sandbox_feedback(
+                    {
+                        "compile_ok": candidate.compile_ok,
+                        "correct": candidate.correct,
+                        "speedup": candidate.speedup,
+                        "metrics": candidate.metrics,
+                        "error": candidate.compile_error,
+                    },
+                    parent_speedup=candidate.speedup,
+                    prev_inner_metrics=candidate.prev_metrics,
+                    kernel_type=self.env.kernel_type,
+                    candidate=candidate,
+                )
+                tasks.append(
+                    self._refine_single_beam(
+                        candidate,
+                        round_num,
+                        profile_fn=profile_fn,
+                        plan_branch={
+                            "name": f"{candidate.strategy}_repair",
+                            "goal": "Repair the failing branch without changing its overall strategy family.",
+                            "what": feedback.next_action,
+                            "change_summary": feedback.next_action,
+                            "bottleneck": "",
+                            "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
+                            "rag_queries": feedback.rag_queries,
+                            "planner_notes": feedback.planner_summary(),
+                            "parent_strategy": candidate.strategy,
+                            "tree_ready": False,
+                        },
+                        fixer_mode=True,
+                        feedback=feedback,
+                    )
+                )
+                fallbacks.append(
+                    self._refine_exception_candidate(
+                        candidate,
+                        round_num,
+                        {
+                            "name": f"{candidate.strategy}_repair",
+                            "parent_strategy": candidate.strategy,
+                        },
+                    )
+                )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        refined = []
+        for fallback, result in zip(fallbacks, results):
+            if isinstance(result, Exception):
+                fallback.compile_error = f"Refinement task failed: {result}"
+                refined.append(fallback)
+            else:
+                refined.append(result)
+        return refined
+
