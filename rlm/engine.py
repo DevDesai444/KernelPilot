@@ -812,3 +812,25 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         c.strategy_context = strat_desc
         return c
 
+    async def generate_beams(
+        self,
+        strategies: list,
+        kernel_slice: str,
+        current_metrics: dict = None,
+        round_num: int = 0,
+        profile_fn=None,
+    ) -> list:
+        tasks = [
+            self._generate_single_beam(
+                s, kernel_slice, current_metrics, round_num, profile_fn)
+            for s in strategies
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            result if not isinstance(result, Exception)
+            else self._beam_exception_candidate(strategy, round_num, result)
+            for strategy, result in zip(strategies, results)
+        ]
+
+    # ── Refinement: multi-turn tool-use loop ─────────────────────────────────
+
