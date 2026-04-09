@@ -1053,3 +1053,87 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         except Exception as e:
             return f"Error reading {candidate_path.relative_to(PROJECT_ROOT)}: {e}"
 
+    def _handle_tool_calls(self, response, messages, profile_fn, strategy_name,
+                           round_num, parent_speedup, prev_inner_metrics):
+        """Process all tool calls in a response.
+
+        Returns (submit_code, submit_block_id, aux_results).
+        aux_results is a list of tool_result dicts for non-submit tools.
+
+        IMPORTANT: Does NOT append to messages — caller is responsible for
+        combining aux_results with submit_kernel result into ONE user message
+        to avoid consecutive user messages (Anthropic API requirement).
+        """
+        aux_results = []
+        submit_code = None
+        submit_block_id = None
+
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            if block.name == "read_file":
+                path = block.input.get("path", "")
+                if not path:
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty path.", "is_error": True,
+                    })
+                else:
+                    logger.info("📖 READ_FILE [%s]: %s", strategy_name, path)
+                    content = self._handle_read_file(path)
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": content,
+                    })
+
+            elif block.name == "search_docs":
+                query = block.input.get("query", "")
+                if not query:
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty query.", "is_error": True,
+                    })
+                else:
+                    from .cuda_docs import search_intrinsics
+                    logger.info("📚 SEARCH_DOCS [%s]: %s", strategy_name, query)
+                    doc_result = search_intrinsics(query)
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": doc_result,
+                    })
+
+            elif block.name == "search_pinecone":
+                query = block.input.get("query", "")
+                top_k = block.input.get("top_k")
+                if not query:
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty query.", "is_error": True,
+                    })
+                else:
+                    logger.info("🧠 SEARCH_PINECONE [%s]: %s", strategy_name, query)
+                    _excl = ["flashinfer", "sakana"] if getattr(self.env, "kernel_type", "") == "add_rmsnorm" else None
+                    matches = self.rag.search_many([query], top_k=top_k or 3,
+                                                   exclude_source_patterns=_excl)
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": self.rag.format_matches(matches),
+                    })
+
+            elif block.name == "submit_kernel":
+                code = block.input.get("cuda_code", "")
+                if not code:
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty cuda_code. Submit the complete .cu file.",
+                        "is_error": True,
+                    })
+                else:
+                    submit_code = code
+                    submit_block_id = block.id
+
+        return submit_code, submit_block_id, aux_results
+
+    # ── Combination step ──────────────────────────────────────────────────────
+
