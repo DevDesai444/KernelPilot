@@ -1028,3 +1028,28 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     # ── Auxiliary tool handlers ────────────────────────────────────────────────
 
+    def _handle_read_file(self, path: str) -> str:
+        """Read an allowed project file."""
+        clean = path.strip()
+        if not clean:
+            return "File path is required."
+
+        candidate_path = (PROJECT_ROOT / clean.lstrip("/")).resolve()
+        if not any(root == candidate_path or root in candidate_path.parents for root in ALLOWED_READ_ROOTS):
+            return (f"Access denied: '{path}'. Allowed paths:\n"
+                    "- kernels/common/nvfp4_utils.cuh\n"
+                    "- kernels/common/b200_intrinsics.cuh\n"
+                    "- kernels/reference/add_rmsnorm.cu\n"
+                    "- kernels/reference/silu_mul.cu\n"
+                    "- kernels/reference/nvfp4_quantize.cu")
+        if not candidate_path.exists():
+            return f"File not found: {clean}"
+        try:
+            content = candidate_path.read_text()
+            # Truncate very large files
+            if len(content) > 12000:
+                content = content[:12000] + "\n... (truncated)"
+            return content
+        except Exception as e:
+            return f"Error reading {candidate_path.relative_to(PROJECT_ROOT)}: {e}"
+
