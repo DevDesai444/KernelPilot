@@ -953,3 +953,78 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             plan_branch=plan_branch,
         )
 
+    async def _refine_single_beam(
+        self,
+        parent: 'KernelCandidate',
+        round_num: int,
+        profile_fn=None,
+        plan_branch: dict | None = None,
+        fixer_mode: bool = False,
+        feedback=None,
+    ) -> 'KernelCandidate':
+        metrics = parent.metrics or {}
+        launch_sig = _get_launch_signature(self.env.kernel_type)
+        base_code = parent.best_code or parent.code
+        plan_branch = dict(plan_branch or parent.plan_branch or {})
+        plan_branch.setdefault("parent_strategy", parent.strategy)
+        branch_name = plan_branch.get("name", "repair")
+        strategy_name = f"{parent.strategy}__{branch_name}_r{round_num}"
+
+        if feedback is None:
+            feedback = build_sandbox_feedback(
+                {
+                    "compile_ok": parent.compile_ok,
+                    "correct": parent.correct,
+                    "speedup": parent.speedup,
+                    "metrics": parent.metrics,
+                    "error": parent.compile_error,
+                },
+                parent_speedup=parent.speedup,
+                prev_inner_metrics=parent.prev_metrics,
+                kernel_type=self.env.kernel_type,
+                candidate=parent,
+            )
+
+        rag_queries = plan_branch.get("rag_queries") or feedback.rag_queries
+        rag_context = self._search_pinecone_context(
+            rag_queries or [f"{self.env.kernel_type} {branch_name} CUDA optimization"]
+        )
+
+        if fixer_mode:
+            initial_prompt = build_fixer_prompt(
+                plan_branch=plan_branch,
+                kernel_code=base_code,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                feedback_json=feedback.to_tool_result_json(),
+            )
+            model_id = self.fixer_model
+        else:
+            current_profile = _format_profile_section(metrics, round_num) if metrics else ""
+            _bcm2 = self.env.baseline_compiler_metrics
+            _baseline_regs2 = int(getattr(_bcm2, "registers_per_thread", 0) or 0) if _bcm2 else 0
+            initial_prompt = build_coder_prompt(
+                plan_branch=plan_branch,
+                kernel_code=base_code,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                current_profile=current_profile,
+                baseline_regs=_baseline_regs2,
+            )
+            model_id = self.sub_model
+
+        return await self._run_agent_loop(
+            initial_prompt=initial_prompt,
+            strategy_name=strategy_name,
+            round_num=round_num,
+            profile_fn=profile_fn,
+            model_id=model_id,
+            comparison_speedup=parent.speedup,
+            prev_inner_metrics=metrics,
+            strategy_context=plan_branch.get("change_summary") or plan_branch.get("what", ""),
+            plan_branch=plan_branch,
+            parent_candidate=parent,
+        )
+
+    # ── Auxiliary tool handlers ────────────────────────────────────────────────
+
