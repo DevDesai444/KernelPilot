@@ -1137,3 +1137,73 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     # ── Combination step ──────────────────────────────────────────────────────
 
+    def combine(self, top_candidates: list) -> KernelCandidate:
+        if len(top_candidates) < 2:
+            return top_candidates[0]
+
+        a, b   = top_candidates[0], top_candidates[1]
+        hot_a  = a.code
+        hot_b  = b.code
+
+        prompt = combine_prompt(
+            variant_a_summary=a.summary(),
+            variant_a_code=hot_a,
+            variant_b_summary=b.summary(),
+            variant_b_code=hot_b,
+        )
+
+        response, _, _ = self._call_llm(prompt, model=self.combine_model, temperature=0.2)
+        combined_code  = self._extract_cuda_code(response)
+
+        if not combined_code:
+            logger.warning("No CUDA code extracted from combine step, using best candidate")
+            return top_candidates[0]
+        return KernelCandidate(
+            code=combined_code,
+            strategy=f"combined_{a.strategy}+{b.strategy}",
+            round_num=self.refine_rounds + 1,
+            compile_ok=True,
+        )
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+
+    def _extract_cuda_code(self, text: str) -> str:
+        # Try code blocks first (with and without language tags)
+        for pattern in [r"```cuda\s*\n(.*?)```", r"```cpp\s*\n(.*?)```",
+                        r"```c\s*\n(.*?)```", r"```\s*\n(.*?)```"]:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        # If no code block but contains CUDA keywords, extract from first CUDA line
+        if "__global__" in text or "__device__" in text or "#include" in text:
+            lines = text.split("\n")
+            start = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if (stripped.startswith("#include") or stripped.startswith("__global__")
+                        or stripped.startswith("__device__") or stripped.startswith("//")
+                        or stripped.startswith("/*") or stripped.startswith("typedef")
+                        or stripped.startswith("template") or stripped.startswith("static")
+                        or stripped.startswith("namespace") or stripped.startswith("extern")):
+                    start = i
+                    break
+            return "\n".join(lines[start:]).strip()
+        return ""
+
+    def _extract_hot_loop_from_code(self, code: str) -> str:
+        lines = code.split("\n")
+        for i, line in enumerate(lines):
+            if "for" in line and ("idx" in line or "tid" in line or "blockIdx" in line):
+                return "\n".join(lines[i:min(i + 25, len(lines))])
+        return code[:800]
+
+    # ── Synchronous wrappers (for beam_search.py) ─────────────────────────────
+
+    def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
+        """Reuse a single event loop to avoid 'Event loop is closed' errors
+        from AsyncAnthropic's httpx connection pool cleanup."""
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        return self._loop
+
