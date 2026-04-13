@@ -1207,3 +1207,35 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         asyncio.set_event_loop(self._loop)
         return self._loop
 
+    def close(self):
+        """Properly close the async client and event loop."""
+        if self._loop is not None and not self._loop.is_closed():
+            try:
+                self._loop.run_until_complete(self.async_client.close())
+            except Exception:
+                pass
+            self._loop.close()
+        self._loop = None
+
+    def __del__(self):
+        self.close()
+
+    def run_decompose(self) -> list:
+        return self.decompose()
+
+    def run_generate_beams(
+        self, strategies: list, kernel_slice: str,
+        current_metrics: dict = None, round_num: int = 0,
+        profile_fn=None,
+    ) -> list:
+        loop = self._get_or_create_loop()
+        return loop.run_until_complete(
+            self.generate_beams(strategies, kernel_slice, current_metrics,
+                                round_num, profile_fn)
+        )
+
+    def run_refine_beams(self, survivors: list, round_num: int,
+                         profile_fn=None) -> list:
+        loop = self._get_or_create_loop()
+        return loop.run_until_complete(
+            self.refine_beams(survivors, round_num, profile_fn))
