@@ -243,3 +243,108 @@ def _lock_gpu_clocks():
         logger.warning("GPU clock locking unavailable: %s", e)
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="RLM beam search kernel optimizer for WaferBench NVFP4"
+    )
+    parser.add_argument("--kernel",     type=str, default=None)
+    parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--beam-width", type=int, default=None)
+    parser.add_argument("--rounds",     type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default="outputs/submissions")
+    parser.add_argument("--config",     type=str, default=None)
+    parser.add_argument("--log-level",  type=str, default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--allow-reference-baseline", action="store_true",
+                        help="Allow unofficial fallback to the local reference-kernel baseline.")
+    args = parser.parse_args()
+
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    # Lock GPU clocks to max to prevent thermal throttling variance
+    _lock_gpu_clocks()
+
+    # --- AGGRESSIVE WARMUP HACK ---
+    # Since we likely cannot lock clocks (no root), we force the GPU into
+    # Max P-State by hammering it with a massive matmul loop for ~1 second
+    # before evaluating any baselines or kernels.
+    import torch
+    logger.info("Forcing GPU into max P-state boost clocks with dummy workload...")
+    dummy_a = torch.randn(8192, 8192, device='cuda', dtype=torch.float16)
+    dummy_b = torch.randn(8192, 8192, device='cuda', dtype=torch.float16)
+    for _ in range(100):
+        _ = torch.matmul(dummy_a, dummy_b)
+    torch.cuda.synchronize()
+    del dummy_a, dummy_b
+    logger.info("GPU is now fully awake. Starting benchmarks...")
+    # ------------------------------
+
+    config_path = args.config or PROJECT_ROOT / "config" / "search_config.yaml"
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    config["_overrides"] = {}
+    if args.beam_width: config["_overrides"]["beam_width"] = args.beam_width
+    if args.rounds:     config["_overrides"]["rounds"]     = args.rounds
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    kernels = WAFERBENCH_KERNELS
+    if args.kernel:
+        kernels = [k for k in WAFERBENCH_KERNELS if k["name"] == args.kernel]
+        if not kernels:
+            logger.error("Unknown kernel: %s. Available: %s",
+                         args.kernel, [k["name"] for k in WAFERBENCH_KERNELS])
+            sys.exit(1)
+
+    all_results = []
+    total_cost  = 0.0
+    for kernel_def in kernels:
+        result = optimize_kernel(
+            kernel_def=kernel_def,
+            config=config,
+            dry_run=args.dry_run,
+            output_dir=output_dir,
+            allow_reference_baseline=args.allow_reference_baseline,
+        )
+        all_results.append(result)
+        total_cost += result.get("metadata", {}).get("api_cost_usd", 0.0)
+
+    print(f"\n{'='*60}")
+    print(f"All kernels complete. Total API cost: ${total_cost:.4f}")
+    if not args.dry_run:
+        speedups = [
+            r.get("performance", {}).get("geomean_speedup", 0)
+            for r in all_results if "performance" in r
+        ]
+        if speedups:
+            print(f"Geometric mean speedup (all kernels): {geometric_mean(speedups):.3f}x")
+
+        # Pass rate summary
+        total_att = sum(r.get("metadata", {}).get("total_attempts", 0) for r in all_results)
+        total_comp = sum(r.get("metadata", {}).get("compile_passes", 0) for r in all_results)
+        total_corr = sum(r.get("metadata", {}).get("correctness_passes", 0) for r in all_results)
+        if total_att > 0:
+            print(f"\nFirst-try pass rates ({total_att} total attempts):")
+            print(f"  Compile:     {total_comp}/{total_att} ({100*total_comp/total_att:.0f}%)")
+            print(f"  Correctness: {total_corr}/{total_att} ({100*total_corr/total_att:.0f}%)")
+
+        # Hack detection summary
+        all_rejections = [
+            rej
+            for r in all_results
+            for rej in r.get("metadata", {}).get("hack_rejections", [])
+        ]
+        if all_rejections:
+            print(f"\nHack rejections: {len(all_rejections)} candidate(s) disqualified")
+            from collections import Counter
+            for hack_type, count in Counter(r["hack_type"] for r in all_rejections).items():
+                print(f"  {hack_type}: {count}")
+        else:
+            print("Hack rejections: 0")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    main()
