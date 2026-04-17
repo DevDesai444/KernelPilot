@@ -77,3 +77,85 @@ finally:
     engine.close()
 PY
 }
+
+coder_check() {
+  local branch_index="${3:-1}"
+  python3 scripts/coder_sandbox_check.py \
+    --kernel "$KERNEL" \
+    --branch-index "$branch_index"
+}
+
+sandbox_check() {
+  local beam_width="${3:-1}"
+  local rounds="${4:-1}"
+  local log_file="$LOG_DIR/sandbox-${KERNEL}-${TIMESTAMP}.log"
+
+  python3 run.py \
+    --kernel "$KERNEL" \
+    --beam-width "$beam_width" \
+    --rounds "$rounds" \
+    --log-level INFO 2>&1 | tee "$log_file"
+
+  echo
+  echo "Saved log: $log_file"
+  echo "Key lines:"
+  rg 'SANDBOX|Planner: generating|Planner produced|route=' "$log_file" || true
+}
+
+tree_check() {
+  local beam_width="${3:-2}"
+  local rounds="${4:-2}"
+  local log_file="$LOG_DIR/tree-${KERNEL}-${TIMESTAMP}.log"
+
+  python3 run.py \
+    --kernel "$KERNEL" \
+    --beam-width "$beam_width" \
+    --rounds "$rounds" \
+    --log-level INFO 2>&1 | tee "$log_file"
+
+  echo
+  echo "Saved log: $log_file"
+  echo "Key lines:"
+  rg 'SANDBOX|Planner: generating|Planner produced|route=planner_tree|route=fixer_with_rag' "$log_file" || true
+}
+
+all_check() {
+  pinecone_check pinecone
+  echo
+  echo "===== PLANNER ====="
+  planner_check
+  echo
+  echo "===== CODER ====="
+  coder_check coder "$KERNEL" 1
+  echo
+  echo "===== SANDBOX ====="
+  sandbox_check sandbox "$KERNEL" 1 1
+  echo
+  echo "===== TREE ====="
+  tree_check tree "$KERNEL" 2 2
+}
+
+case "$MODE" in
+  pinecone)
+    pinecone_check "$@"
+    ;;
+  planner)
+    planner_check
+    ;;
+  coder)
+    coder_check "$@"
+    ;;
+  sandbox)
+    sandbox_check "$@"
+    ;;
+  tree)
+    tree_check "$@"
+    ;;
+  all)
+    all_check
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
