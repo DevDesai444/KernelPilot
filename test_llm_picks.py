@@ -165,3 +165,81 @@ Respond with ONLY the JSON array, nothing else."""
 
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
+def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
+    """Call the LLM and return (parsed, raw_response, tokens_in, tokens_out, latency)."""
+    t0 = time.time()
+    response = client.messages.create(
+        model=model_id,
+        max_tokens=512,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    latency = time.time() - t0
+    text = response.content[0].text
+    tokens_in = response.usage.input_tokens
+    tokens_out = response.usage.output_tokens
+    return text, tokens_in, tokens_out, latency
+
+
+def parse_menu_response(text: str) -> list:
+    """Parse a JSON array of strategy name strings."""
+    json_match = re.search(r'\[.*?\]', text, re.DOTALL)
+    if json_match:
+        try:
+            raw = json.loads(json_match.group())
+            return [s for s in raw if isinstance(s, str)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
+def parse_freeform_response(text: str) -> list:
+    """Parse a JSON array of {name, what} objects."""
+    json_match = re.search(r'\[.*?\]', text, re.DOTALL)
+    if json_match:
+        try:
+            raw = json.loads(json_match.group())
+            return [item for item in raw if isinstance(item, dict) and "name" in item]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
+# ── Menu mode ─────────────────────────────────────────────────────────────────
+
+def run_menu_test(client: anthropic.Anthropic, model_name: str, model_id: str):
+    """Menu mode: pick 4 from predefined list."""
+    print(f"\n{'='*70}")
+    print(f"  MODE: MENU | MODEL: {model_name} ({model_id})")
+    print(f"{'='*70}")
+
+    pricing = {
+        "haiku":  {"in": 0.25, "out": 1.25},
+        "sonnet": {"in": 3.0,  "out": 15.0},
+        "opus":   {"in": 15.0, "out": 75.0},
+    }
+    price = pricing.get(model_name, {"in": 3.0, "out": 15.0})
+    total_cost = 0.0
+
+    for kernel_type, src_path in KERNELS.items():
+        kernel_src = src_path.read_text()
+        prompt = build_menu_prompt(kernel_src, kernel_type)
+
+        print(f"\n  --- {kernel_type} ---")
+        text, tok_in, tok_out, latency = call_llm(client, prompt, model_id)
+        cost = (tok_in * price["in"] + tok_out * price["out"]) / 1_000_000
+        total_cost += cost
+
+        picks = parse_menu_response(text)
+        print(f"  Picked:   {picks}")
+        print(f"  Tokens:   in={tok_in} out={tok_out}  Cost: ${cost:.4f}  Latency: {latency:.1f}s")
+
+        if not picks:
+            print(f"  RAW:      {text[:200]}")
+
+    print(f"\n  Total cost: ${total_cost:.4f}")
+    return total_cost
+
+
+# ── Free-form mode ────────────────────────────────────────────────────────────
+
