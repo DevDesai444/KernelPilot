@@ -97,3 +97,71 @@ KERNELS = {
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
+def build_strategy_menu(kernel_type: str) -> str:
+    """Build a formatted strategy menu showing all strategies."""
+    lines = []
+    for name, info in STRATEGY_DESCRIPTIONS.items():
+        applicable = info["applicable"]
+        applies = "YES" if (not applicable or kernel_type in applicable) else "NO (not applicable to this kernel type)"
+        lines.append(f"  - {name}: {info['desc']}")
+        lines.append(f"    Applicable to this kernel: {applies}")
+    return "\n".join(lines)
+
+
+def build_menu_prompt(kernel_src: str, kernel_type: str) -> str:
+    menu = build_strategy_menu(kernel_type)
+    return f"""\
+You are a CUDA optimization expert. Select exactly 4 strategies for this kernel.
+
+Kernel type: {kernel_type}
+Target: NVIDIA B200 (Blackwell, sm_100a)
+
+```cuda
+{kernel_src}
+```
+
+Available strategies:
+{menu}
+
+RULES:
+- Pick only strategies marked "Applicable: YES"
+- Pick strategies that match what this kernel actually does
+- Do NOT explain your reasoning
+- Respond with ONLY a JSON array, nothing else
+
+Example response format:
+["strategy_a", "strategy_b", "strategy_c", "strategy_d"]
+
+Your response (JSON array only):"""
+
+
+def build_freeform_prompt(kernel_src: str, kernel_type: str) -> str:
+    return f"""\
+You are a CUDA optimization expert. Analyze this kernel and propose exactly 4
+optimization techniques that would give the biggest speedup.
+
+You are NOT limited to any predefined list. Propose whatever CUDA optimizations
+you think are most impactful for THIS SPECIFIC kernel. Be specific and concrete.
+
+Kernel type: {kernel_type}
+Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 142 SMs)
+
+```cuda
+{kernel_src}
+```
+
+For each optimization, give a short name and one-line description of what to do.
+
+Return as a JSON array of objects, most impactful first:
+[
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}}
+]
+
+Respond with ONLY the JSON array, nothing else."""
+
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
