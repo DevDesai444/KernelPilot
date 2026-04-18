@@ -243,3 +243,67 @@ def run_menu_test(client: anthropic.Anthropic, model_name: str, model_id: str):
 
 # ── Free-form mode ────────────────────────────────────────────────────────────
 
+def run_freeform_test(client: anthropic.Anthropic, model_name: str, model_id: str):
+    """Free-form mode: LLM proposes optimizations from scratch."""
+    print(f"\n{'='*70}")
+    print(f"  MODE: FREE-FORM | MODEL: {model_name} ({model_id})")
+    print(f"{'='*70}")
+
+    pricing = {
+        "haiku":  {"in": 0.25, "out": 1.25},
+        "sonnet": {"in": 3.0,  "out": 15.0},
+        "opus":   {"in": 15.0, "out": 75.0},
+    }
+    price = pricing.get(model_name, {"in": 3.0, "out": 15.0})
+    total_cost = 0.0
+
+    for kernel_type, src_path in KERNELS.items():
+        kernel_src = src_path.read_text()
+        prompt = build_freeform_prompt(kernel_src, kernel_type)
+
+        print(f"\n  --- {kernel_type} ---")
+        text, tok_in, tok_out, latency = call_llm(client, prompt, model_id)
+        cost = (tok_in * price["in"] + tok_out * price["out"]) / 1_000_000
+        total_cost += cost
+
+        strategies = parse_freeform_response(text)
+
+        if strategies:
+            for i, s in enumerate(strategies, 1):
+                name = s.get("name", "?")
+                what = s.get("what", "?")
+                print(f"  {i}. {name:30s} — {what}")
+        else:
+            print(f"  PARSE FAILED. Raw response:")
+            print(f"  {text[:500]}")
+
+        print(f"  Tokens:   in={tok_in} out={tok_out}  Cost: ${cost:.4f}  Latency: {latency:.1f}s")
+
+    print(f"\n  Total cost: ${total_cost:.4f}")
+    return total_cost
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Test LLM strategy selection")
+    parser.add_argument("--model", default="haiku",
+                        choices=["haiku", "sonnet", "opus", "all"],
+                        help="Which model to test (default: haiku)")
+    parser.add_argument("--mode", default="menu",
+                        choices=["menu", "freeform", "both"],
+                        help="menu=predefined list, freeform=open-ended, both=run both")
+    args = parser.parse_args()
+
+    client = anthropic.Anthropic()
+    models_to_test = MODELS.items() if args.model == "all" else [(args.model, MODELS[args.model])]
+
+    for name, model_id in models_to_test:
+        if args.mode in ("menu", "both"):
+            run_menu_test(client, name, model_id)
+        if args.mode in ("freeform", "both"):
+            run_freeform_test(client, name, model_id)
+
+
+if __name__ == "__main__":
+    main()
