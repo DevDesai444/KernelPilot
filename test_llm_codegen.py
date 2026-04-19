@@ -447,3 +447,57 @@ __device__ __forceinline__ void prefetch_l2(const void* ptr) {}
 '''
 
 
+def write_stub_headers(parent_dir: str):
+    """Write stub nvfp4_utils.cuh and b200_intrinsics.cuh under parent_dir/common/."""
+    common = os.path.join(parent_dir, "common")
+    os.makedirs(common, exist_ok=True)
+    with open(os.path.join(common, "nvfp4_utils.cuh"), "w") as f:
+        f.write(STUB_NVFP4)
+    with open(os.path.join(common, "b200_intrinsics.cuh"), "w") as f:
+        f.write(STUB_B200)
+
+
+# ── Compilation ──────────────────────────────────────────────────────────────
+
+def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
+    """Try to compile CUDA code with nvcc. Returns (success, error_msg)."""
+    nvcc = _find_nvcc()
+    if arch is None:
+        arch = "sm_80"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_file = os.path.join(tmpdir, f"{kernel_type}_optimized.cu")
+        obj_file = os.path.join(tmpdir, f"{kernel_type}_optimized.o")
+
+        with open(src_file, "w") as f:
+            f.write(cuda_code)
+
+        try:
+            result = subprocess.run(
+                [nvcc, "-c", "-O3", "--std=c++17",
+                 f"-arch={arch}",
+                 f"-I{COMMON_DIR}",
+                 f"-I{COMMON_DIR.parent}",
+                 "-o", obj_file, src_file],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                return True, ""
+            else:
+                err = result.stderr
+                err_lines = [l for l in err.split("\n") if "error" in l.lower()]
+
+                header_errors = [l for l in err_lines
+                                 if "nvfp4_utils.cuh" in l or "b200_intrinsics.cuh" in l
+                                 or "__nv_cvt" in l or "__NV_E4M3" in l]
+
+                if header_errors:
+                    return try_compile_syntax_only(cuda_code, kernel_type, nvcc, tmpdir)
+
+                return False, "\n".join(err_lines[:5]) if err_lines else err[:300]
+        except FileNotFoundError:
+            return False, "nvcc not found"
+        except subprocess.TimeoutExpired:
+            return False, "compilation timed out (60s)"
+
+
