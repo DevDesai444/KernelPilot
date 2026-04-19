@@ -145,3 +145,91 @@ TASKS = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def expand_includes(src: str, src_path: Path) -> str:
+    """Expand local #include directives so the LLM sees helper functions."""
+    lines = src.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('#include "') and stripped.endswith('"'):
+            rel_path = stripped[len('#include "'):-1]
+            header = src_path.parent / rel_path
+            if header.exists():
+                result.append(f"// === expanded from {rel_path} ===")
+                result.append(header.read_text())
+                result.append(f"// === end {rel_path} ===")
+                continue
+        result.append(line)
+    return "\n".join(result)
+
+
+def extract_cuda_code(text: str) -> str:
+    """Extract CUDA code from LLM response."""
+    for pattern in [r"```cuda\s*\n(.*?)```", r"```cpp\s*\n(.*?)```",
+                    r"```c\s*\n(.*?)```", r"```\s*\n(.*?)```"]:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    if "__global__" in text or "#include" in text:
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s.startswith("#include") or s.startswith("__global__") or s.startswith("//"):
+                return "\n".join(lines[i:]).strip()
+    return ""
+
+
+def detect_cuda_arch() -> str:
+    """Detect best CUDA arch that nvcc can compile (for compile-only tests)."""
+    nvcc = _find_nvcc()
+    test_code = '''\
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+__device__ float test() {
+    __nv_fp8_storage_t x = 0;
+    return __nv_cvt_fp8_to_float(x, __NV_E4M3);
+}
+'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "test.cu")
+        obj = os.path.join(tmpdir, "test.o")
+        with open(src, "w") as f:
+            f.write(test_code)
+        for arch in ["sm_100a", "sm_90a", "sm_89", "sm_80"]:
+            try:
+                result = subprocess.run(
+                    [nvcc, "-c", f"-arch={arch}", "-o", obj, src],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    return arch
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+    return "sm_80"
+
+
+def detect_gpu_arch() -> str:
+    """Detect actual GPU compute capability (for running kernels)."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            cap = result.stdout.strip().split("\n")[0].strip()
+            major, minor = cap.split(".")
+            return f"sm_{major}{minor}"
+    except Exception:
+        pass
+    return None
+
+
+def has_gpu() -> bool:
+    """Check if an NVIDIA GPU is available."""
+    try:
+        result = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
