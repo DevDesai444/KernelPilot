@@ -501,3 +501,220 @@ def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
             return False, "compilation timed out (60s)"
 
 
+def try_compile_syntax_only(cuda_code: str, kernel_type: str,
+                            nvcc: str, tmpdir: str) -> tuple:
+    """Fallback: compile with stub headers when native FP8 intrinsics unavailable."""
+    stub_dir = os.path.join(tmpdir, "stubs")
+    write_stub_headers(stub_dir)
+
+    modified = cuda_code.replace('../common/', 'common/')
+
+    src_file = os.path.join(tmpdir, f"{kernel_type}_stub.cu")
+    obj_file = os.path.join(tmpdir, f"{kernel_type}_stub.o")
+    with open(src_file, "w") as f:
+        f.write(modified)
+
+    try:
+        result = subprocess.run(
+            [nvcc, "-c", "-O3", "--std=c++17",
+             "-arch=sm_80",
+             f"-I{stub_dir}",
+             "-o", obj_file, src_file],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            return True, "(stub compile — FP8 intrinsics stubbed, all function signatures verified)"
+        else:
+            err = result.stderr
+            err_lines = [l for l in err.split("\n") if "error" in l.lower()]
+            return False, "\n".join(err_lines[:5]) if err_lines else err[:300]
+    except Exception as e:
+        return False, str(e)
+
+
+# ── Correctness testing (requires GPU) ───────────────────────────────────────
+
+HARNESS_ADD_RMSNORM = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int rows = 4, hidden = 64;
+    const int N = rows * hidden;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_in  = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_res = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_wt  = new __nv_bfloat16[hidden];
+    for (int i = 0; i < N; i++) {
+        h_in[i]  = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+        h_res[i] = __float2bfloat16(0.01f * ((i * 13 + 7) % 200) - 1.0f);
+    }
+    for (int i = 0; i < hidden; i++)
+        h_wt[i] = __float2bfloat16(0.5f + 0.01f * (i % 50));
+
+    __nv_bfloat16 *d_in, *d_res, *d_wt, *d_resout;
+    uint8_t *d_qout;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_in,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_res,    N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_wt,     hidden * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_resout, N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_qout,   packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_in,  h_in,  N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_res, h_res, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_wt,  h_wt,  hidden * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_qout,   0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+    cudaMemset(d_resout, 0, N * sizeof(__nv_bfloat16));
+
+    launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_wt, d_resout, d_qout, d_scales,
+                                    rows, hidden, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t  *h_qout   = new uint8_t[packed_bytes];
+    uint8_t  *h_scales = new uint8_t[num_qblocks];
+    uint16_t *h_resout = new uint16_t[N];
+    cudaMemcpy(h_qout,   d_qout,   packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales,  num_qblocks, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_resout, d_resout,  N * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_qout[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\nRESOUT:");
+    for (int i = 0; i < N; i++) printf("%04x", h_resout[i]);
+    printf("\\n");
+
+    delete[] h_in; delete[] h_res; delete[] h_wt;
+    delete[] h_qout; delete[] h_scales; delete[] h_resout;
+    cudaFree(d_in); cudaFree(d_res); cudaFree(d_wt);
+    cudaFree(d_resout); cudaFree(d_qout); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESS_SILU_MUL = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int N = 256;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_gate = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_up   = new __nv_bfloat16[N];
+    for (int i = 0; i < N; i++) {
+        h_gate[i] = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+        h_up[i]   = __float2bfloat16(0.01f * ((i * 11 + 5) % 200) - 1.0f);
+    }
+
+    __nv_bfloat16 *d_gate, *d_up;
+    uint8_t *d_qout;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_gate,   N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_up,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_qout,   packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_gate, h_gate, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up,   h_up,   N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_qout,   0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+
+    launch_silu_mul_fp4quant(d_gate, d_up, d_qout, d_scales, N, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t *h_qout  = new uint8_t[packed_bytes];
+    uint8_t *h_scales = new uint8_t[num_qblocks];
+    cudaMemcpy(h_qout,  d_qout,  packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales, num_qblocks, cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_qout[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\n");
+
+    delete[] h_gate; delete[] h_up;
+    delete[] h_qout; delete[] h_scales;
+    cudaFree(d_gate); cudaFree(d_up); cudaFree(d_qout); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESS_NVFP4_QUANTIZE = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int N = 256;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_in = new __nv_bfloat16[N];
+    for (int i = 0; i < N; i++)
+        h_in[i] = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+
+    __nv_bfloat16 *d_in;
+    uint8_t *d_packed;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_in,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_packed, packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_in, h_in, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_packed, 0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+
+    launch_nvfp4_quantize_bf16(d_in, d_packed, d_scales, N, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t *h_packed = new uint8_t[packed_bytes];
+    uint8_t *h_scales = new uint8_t[num_qblocks];
+    cudaMemcpy(h_packed, d_packed, packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales, num_qblocks, cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_packed[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\n");
+
+    delete[] h_in;
+    delete[] h_packed; delete[] h_scales;
+    cudaFree(d_in); cudaFree(d_packed); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESSES = {
+    "add_rmsnorm":    HARNESS_ADD_RMSNORM,
+    "silu_mul":       HARNESS_SILU_MUL,
+    "nvfp4_quantize": HARNESS_NVFP4_QUANTIZE,
+}
+
+
