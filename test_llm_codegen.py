@@ -804,3 +804,81 @@ def compare_outputs(ref_stdout: str, opt_stdout: str) -> tuple:
         return False, f"{mismatch_pct:.1f}% mismatch ({mismatches}/{total_bytes} bytes)"
 
 
+def check_correctness(cuda_code: str, kernel_type: str, nvcc: str) -> tuple:
+    """Run both reference and optimized kernels on GPU, compare outputs.
+    Returns (is_correct: bool|None, detail_msg: str).
+    None means correctness couldn't be tested (reference failed etc.)."""
+    gpu_arch = detect_gpu_arch()
+    if not gpu_arch:
+        return None, "no GPU detected"
+
+    ref_raw = KERNELS[kernel_type].read_text()
+    harness = HARNESSES[kernel_type]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Try native compilation first (real headers)
+        native_include = str(COMMON_DIR.parent)
+        ref_out, ref_err = compile_and_run_kernel(
+            ref_raw, harness, kernel_type, "ref",
+            nvcc, gpu_arch, native_include, tmpdir)
+
+        if ref_out is None:
+            # Native failed — fall back to stubs
+            stub_dir = os.path.join(tmpdir, "stubs")
+            write_stub_headers(stub_dir)
+            ref_out, ref_err = compile_and_run_kernel(
+                ref_raw, harness, kernel_type, "ref_stub",
+                nvcc, "sm_80", stub_dir, tmpdir)
+            if ref_out is None:
+                return None, f"reference failed: {ref_err}"
+            # Use stubs for optimized too
+            include_dir = stub_dir
+            arch = "sm_80"
+        else:
+            include_dir = native_include
+            arch = gpu_arch
+
+        opt_out, opt_err = compile_and_run_kernel(
+            cuda_code, harness, kernel_type, "opt",
+            nvcc, arch, include_dir, tmpdir)
+
+        if opt_out is None:
+            return False, f"run failed: {opt_err}"
+
+        return compare_outputs(ref_out, opt_out)
+
+
+# ── Prompt ───────────────────────────────────────────────────────────────────
+
+def build_codegen_prompt(kernel_src_expanded: str, task: dict) -> str:
+    """Build a prompt asking the LLM to apply a specific optimization."""
+    return f"""\
+You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
+
+Apply this optimization to the kernel below:
+
+## Optimization: {task['name']}
+{task['instruction']}
+
+## Full kernel source (headers expanded inline between === markers):
+```cuda
+{kernel_src_expanded}
+```
+
+CRITICAL RULES:
+1. Return the COMPLETE .cu file in a single ```cuda code block
+2. Keep all #includes (use the original #include directives, NOT the expanded content)
+3. Keep ALL kernel functions and the launch_* wrapper function
+4. Do NOT change the launch_* function signature
+5. Output must match reference within atol=1e-2
+6. No explanations — just the code block
+7. You may call any function defined in the expanded headers above (e.g. load_bf16x8,
+   load_float4, quantize_block_nvfp4, etc.). Do NOT invent helper functions that aren't
+   defined in the headers.
+8. For vectorized stores, use raw casts like:
+     *reinterpret_cast<uint2*>(&out[idx]) = packed_val;
+"""
+
+
+# ── Main test ─────────────────────────────────────────────────────────────────
+
