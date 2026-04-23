@@ -882,3 +882,145 @@ CRITICAL RULES:
 
 # ── Main test ─────────────────────────────────────────────────────────────────
 
+def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
+             kernel_filter: str = None, check: bool = False):
+    print(f"\n{'='*70}")
+    print(f"  CODEGEN TEST | MODEL: {model_name}" +
+          (" | CORRECTNESS CHECK" if check else ""))
+    print(f"{'='*70}")
+
+    arch = detect_cuda_arch()
+    print(f"  CUDA arch: {arch}")
+
+    nvcc = _find_nvcc()
+
+    if check:
+        gpu_arch = detect_gpu_arch()
+        if gpu_arch:
+            print(f"  GPU arch:  {gpu_arch}")
+        else:
+            print(f"  GPU:       not detected — correctness checks will be skipped")
+            check = False
+
+    price = PRICING.get(model_name, {"in": 3.0, "out": 15.0})
+    total_cost = 0.0
+    total_tasks = 0
+    extract_pass = 0
+    compile_pass = 0
+    correct_pass = 0
+    correct_tested = 0
+    results = []
+
+    for kernel_type, tasks in TASKS.items():
+        if kernel_filter and kernel_type != kernel_filter:
+            continue
+
+        src_path = KERNELS[kernel_type]
+        kernel_src_raw = src_path.read_text()
+        kernel_src_expanded = expand_includes(kernel_src_raw, src_path)
+
+        print(f"\n  -- {kernel_type} --")
+
+        for task in tasks:
+            total_tasks += 1
+            prompt = build_codegen_prompt(kernel_src_expanded, task)
+
+            t0 = time.time()
+            response = client.messages.create(
+                model=model_id,
+                max_tokens=8192,
+                temperature=0.2,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            latency = time.time() - t0
+            text = response.content[0].text
+            tok_in = response.usage.input_tokens
+            tok_out = response.usage.output_tokens
+            cost = (tok_in * price["in"] + tok_out * price["out"]) / 1_000_000
+            total_cost += cost
+
+            # Extract code
+            code = extract_cuda_code(text)
+            has_code = bool(code)
+            if has_code:
+                extract_pass += 1
+
+            # Try compile
+            compiled = False
+            compile_err = ""
+            if has_code:
+                compiled, compile_err = try_compile(code, kernel_type, arch)
+                if compiled:
+                    compile_pass += 1
+
+            # Correctness check
+            correct = None
+            correct_msg = ""
+            if check and compiled and has_code:
+                correct_tested += 1
+                correct, correct_msg = check_correctness(code, kernel_type, nvcc)
+                if correct:
+                    correct_pass += 1
+
+            # Build status string
+            if compiled:
+                status = "COMPILE OK"
+            elif has_code:
+                status = "COMPILE FAIL"
+            else:
+                status = "NO CODE"
+
+            if check:
+                if correct is True:
+                    corr_str = "CORRECT" + ("*" if correct_msg else "")
+                elif correct is False:
+                    corr_str = "WRONG"
+                elif compiled:
+                    corr_str = "SKIP"
+                else:
+                    corr_str = ""
+                print(f"    {task['name']:25s}  {status:14s}  {corr_str:10s}  "
+                      f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
+            else:
+                print(f"    {task['name']:25s}  {status:14s}  "
+                      f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
+
+            if compile_err and not compiled:
+                for err_line in compile_err.split("\n")[:3]:
+                    if err_line.strip():
+                        print(f"      err: {err_line.strip()[:120]}")
+            if correct_msg:
+                print(f"      {correct_msg[:120]}")
+
+            results.append({
+                "kernel": kernel_type,
+                "strategy": task["name"],
+                "model": model_name,
+                "extracted": has_code,
+                "compiled": compiled,
+                "correct": correct,
+                "tokens_out": tok_out,
+                "cost": cost,
+                "latency": latency,
+                "compile_error": compile_err[:200] if compile_err else "",
+                "correct_msg": correct_msg[:200] if correct_msg else "",
+            })
+
+    # Summary
+    print(f"\n  {'─'*50}")
+    print(f"  CODE EXTRACTION:  {extract_pass}/{total_tasks} "
+          f"({extract_pass/total_tasks*100:.0f}%)")
+    print(f"  COMPILE PASS@1:   {compile_pass}/{total_tasks} "
+          f"({compile_pass/total_tasks*100:.0f}%)")
+    if check:
+        if correct_tested > 0:
+            print(f"  CORRECT PASS@1:   {correct_pass}/{correct_tested} "
+                  f"({correct_pass/correct_tested*100:.0f}%)")
+        else:
+            print(f"  CORRECT PASS@1:   no kernels compiled to test")
+    print(f"  TOTAL COST:       ${total_cost:.4f}")
+    print(f"  {'─'*50}")
+
+    return results
+
+
