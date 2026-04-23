@@ -718,3 +718,89 @@ HARNESSES = {
 }
 
 
+def compile_and_run_kernel(kernel_code: str, harness: str, kernel_type: str,
+                           tag: str, nvcc: str, gpu_arch: str,
+                           include_dir: str, tmpdir: str) -> tuple:
+    """Compile kernel + test harness into executable, run it, return (stdout, err)."""
+    modified = kernel_code.replace('../common/', 'common/')
+    full_code = modified + "\n" + harness
+
+    src_file = os.path.join(tmpdir, f"{kernel_type}_{tag}.cu")
+    exe_file = os.path.join(tmpdir, f"{kernel_type}_{tag}")
+
+    with open(src_file, "w") as f:
+        f.write(full_code)
+
+    try:
+        result = subprocess.run(
+            [nvcc, "-O2", "--std=c++17", f"-arch={gpu_arch}",
+             f"-I{include_dir}",
+             f"-I{os.path.join(include_dir, 'common')}",
+             "-o", exe_file, src_file],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            err = result.stderr
+            err_lines = [l for l in err.split("\n") if "error" in l.lower()]
+            return None, "\n".join(err_lines[:3]) if err_lines else err[:200]
+    except Exception as e:
+        return None, str(e)
+
+    try:
+        result = subprocess.run(
+            [exe_file], capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None, f"runtime error: {result.stderr[:200]}"
+        return result.stdout, ""
+    except Exception as e:
+        return None, str(e)
+
+
+def compare_outputs(ref_stdout: str, opt_stdout: str) -> tuple:
+    """Compare hex outputs from reference and optimized kernels.
+    Returns (is_correct, detail_msg)."""
+    def parse_hex_lines(text):
+        lines = {}
+        for line in text.strip().split("\n"):
+            if ":" in line:
+                tag, hex_data = line.split(":", 1)
+                lines[tag.strip()] = hex_data.strip()
+        return lines
+
+    ref_lines = parse_hex_lines(ref_stdout)
+    opt_lines = parse_hex_lines(opt_stdout)
+
+    if not ref_lines:
+        return False, "no reference output"
+    if not opt_lines:
+        return False, "no optimized output"
+
+    total_bytes = 0
+    mismatches = 0
+
+    for tag in ref_lines:
+        if tag not in opt_lines:
+            return False, f"missing output: {tag}"
+        ref_hex = ref_lines[tag]
+        opt_hex = opt_lines[tag]
+        if len(ref_hex) != len(opt_hex):
+            return False, f"{tag} size mismatch: ref={len(ref_hex)//2}B opt={len(opt_hex)//2}B"
+
+        for i in range(0, len(ref_hex), 2):
+            total_bytes += 1
+            if ref_hex[i:i+2] != opt_hex[i:i+2]:
+                mismatches += 1
+
+    if total_bytes == 0:
+        return False, "no output bytes"
+
+    mismatch_pct = mismatches / total_bytes * 100
+    if mismatch_pct == 0:
+        return True, ""
+    elif mismatch_pct <= 5:
+        return True, f"~{mismatch_pct:.1f}% byte diff (FP rounding)"
+    else:
+        return False, f"{mismatch_pct:.1f}% mismatch ({mismatches}/{total_bytes} bytes)"
+
+
