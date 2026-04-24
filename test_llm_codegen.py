@@ -1024,3 +1024,51 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
     return results
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Test LLM CUDA code generation")
+    parser.add_argument("--model", default="sonnet",
+                        choices=["haiku", "sonnet", "opus", "all"])
+    parser.add_argument("--kernel", default=None,
+                        choices=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
+                        help="Test only one kernel type")
+    parser.add_argument("--check", action="store_true",
+                        help="Run correctness check on GPU (requires NVIDIA GPU)")
+    args = parser.parse_args()
+
+    if args.check and not has_gpu():
+        print("WARNING: --check requires an NVIDIA GPU. No GPU detected.")
+        print("         Running compile-only mode.\n")
+        args.check = False
+
+    client = anthropic.Anthropic()
+    all_results = []
+
+    if args.model == "all":
+        for name, model_id in MODELS.items():
+            results = run_test(client, name, model_id, args.kernel, args.check)
+            all_results.extend(results)
+
+        # Comparison
+        print(f"\n{'='*70}")
+        print(f"  COMPARISON")
+        print(f"{'='*70}")
+        for name in MODELS:
+            mine = [r for r in all_results if r["model"] == name]
+            compiled = sum(1 for r in mine if r["compiled"])
+            total = len(mine)
+            cost = sum(r["cost"] for r in mine)
+            line = f"  {name:8s}  compile={compiled}/{total} ({compiled/total*100:.0f}%)"
+            if args.check:
+                tested = [r for r in mine if r["correct"] is not None]
+                correct = sum(1 for r in tested if r["correct"])
+                if tested:
+                    line += f"  correct={correct}/{len(tested)} ({correct/len(tested)*100:.0f}%)"
+            line += f"  cost=${cost:.4f}"
+            print(line)
+    else:
+        model_id = MODELS[args.model]
+        run_test(client, args.model, model_id, args.kernel, args.check)
+
+
+if __name__ == "__main__":
+    main()
