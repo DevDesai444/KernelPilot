@@ -1,0 +1,21 @@
+{
+  "name": "combined_128threads_smem_cache_vectorized",
+  "goal": "Fix all three primary bottlenecks: 50% Phase-2 thread waste, Phase-2 global re-read, scalar loads",
+  "bottleneck": "Phase-2 loop `for(qb=tid; qb<128; qb+=256)` leaves threads 128-255 idle (50% waste). Phase-2 re-reads residual_out from global memory. Scalar bf16 loads (float4=0).",
+  "change_summary": "Set BLOCK_THREADS=128 with __launch_bounds__(128, 16). Allocate smem as __nv_bfloat16[2048] (4096 bytes) + float[4] for 4 warp partial sums (total 4112 bytes). Phase-1: load 8 bf16 per iteration using uint4 reinterpret cast (two uint4 loads per thread covering all 16 elements), accumulate ss, write residual_out AND store to smem_cache[i]. Warp-shuffle reduction: each warp reduces to one value using __shfl_xor_sync, lane-0 writes to smem_ws[warp_id], single __syncthreads, warp-0 reduces 4 partial sums. Phase-2: each of 128 threads handles exactly 1 quant block (qb=tid, 0 to 127), reads 16 bf16 from smem_cache[qb*16..qb*16+15] (no global reread), normalizes with rms_weight, computes amax, scale, packs 8 FP4 pairs using quantize_block_nvfp4 from nvfp4_utils.cuh.",
+  "expected_signal": "Kernel time below 5us; occupancy 100%; regs=32; zero Phase-2 global loads for norm data",
+  "planner_notes": "smem layout: smem_bf16 = ((__nv_bfloat16*)smem), smem_ws = ((float*)(smem_bf16 + 2048)). Total smem = 2048*2 + 4*4 = 4112 bytes. __launch_bounds__(128, 16) forces <=32 regs on SM100. uint4 loads require 16-byte alignment (PyTorch tensors are always 256-byte aligned). With 128 threads and 2048 hidden_size: Phase-1 each thread loads 2048/128=16 elements using two uint4 loads. Phase-2 each thread handles quant block qb=tid (no loop needed, exactly 1 block per thread).",
+  "rag_queries": [
+    "fused add rmsnorm fp4 128 threads vectorized smem cache warp shuffle",
+    "quantize_block_nvfp4 nvfp4_utils fused normalize quantize kernel"
+  ],
+  "rationale": "50% thread waste is primary bottleneck. With 128 threads: 2048/128=16 elements per thread = exactly NVFP4_BLOCK_SIZE=16 quant block. All threads work in both phases. smem cache eliminates 512KB re-read. uint4 loads cut load instructions 8x.",
+  "risk": "smem + register pressure from holding 16 bf16 across phases. __launch_bounds__(128,16) gives compiler flexibility to spill if needed.",
+  "evidence": [
+    "Phase-2 loop with 256 threads and 128 quant blocks: threads 128-255 execute zero iterations",
+    "float block_vals[NVFP4_BLOCK_SIZE] = float[16] is source of 40 registers",
+    "Baseline profiler: float4=0 — no vectorization"
+  ],
+  "tree_ready": false,
+  "what": "Set BLOCK_THREADS=128 with __launch_bounds__(128, 16). smem cache of Phase-1 bf16 values. uint4 vectorized loads. Warp shuffle reduction. Phase-2 reads from smem. All 128 threads active throughout."
+}
