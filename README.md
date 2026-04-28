@@ -111,3 +111,87 @@ beam:
 
 ---
 
+## RAG Pipeline
+
+Pinecone vector database (`cuda-kernels-v2`) indexed with real production CUDA kernels from open-source projects. At planning time:
+
+1. Query embedded using the kernel type + operation description
+2. Top-K candidates retrieved and reranked by source quality + semantic similarity
+3. Most relevant source patterns injected as context into the planner prompt
+4. Agents can call `SEARCH_DOCS` tool mid-generation for additional targeted lookups
+
+### Data Sources
+
+| Source | Type | Quality Weight |
+|--------|------|---------------|
+| FlashInfer | Production inference kernels | 1.0 |
+| vLLM | Production inference kernels | 1.0 |
+| SGLang | Production inference kernels | 1.0 |
+| CUTLASS | NVIDIA template library | 0.95 |
+| Triton | GPU compiler kernels | 0.95 |
+| PyTorch | Framework CUDA kernels | 0.9 |
+| Apex | NVIDIA training utilities | 0.9 |
+| LMDeploy | Production inference kernels | 0.85 |
+
+Source quality weights ensure production kernels (FlashInfer, vLLM) are preferred over synthetic data. The index uses Pinecone integrated inference with `multilingual-e5-large` embeddings and reranking.
+
+---
+
+## Setup
+
+### Requirements
+
+```bash
+pip install -r requirements.txt
+# torch + flashinfer for eval (GPU required)
+```
+
+### Environment Variables
+
+```bash
+ANTHROPIC_API_KEY=...
+PINECONE_API_KEY=...
+PINECONE_INDEX_NAME=cuda-kernels-v2
+PINECONE_INDEX_HOST=...
+```
+
+### Run
+
+```bash
+# All kernels
+python run.py
+
+# Single kernel
+python run.py --kernel add_rmsnorm_fp4quant_b128xh2048
+
+# Custom beam width / rounds
+python run.py --kernel nvfp4_quantize_m128xk14336 --beam-width 4 --rounds 4
+```
+
+---
+
+## Evaluation Methodology
+
+- **Baseline**: FlashInfer production kernel, timed with CUDA graph replay + L2 cache cycling (500 warmup, 100 timed iterations)
+- **Candidate**: Same timing methodology for fair apples-to-apples comparison
+- **Correctness**: Max absolute error < 1e-2, relative error < 1e-3, validated across 3 seeds
+- **Hardware**: NVIDIA B200 (sm_100a, Blackwell architecture)
+
+---
+
+## Project Structure
+
+```
+RLM-kernel-optimizer/
+├── run.py                    # Entry point
+├── config/
+│   ├── search_config.yaml    # Beam search + model config
+│   └── b200_spec.yaml        # B200 hardware spec
+├── kernels/
+│   ├── reference/            # Reference kernels (baseline)
+│   └── common/               # Shared CUDA headers (nvfp4_utils.cuh)
+├── rlm/                      # Agent engine
+├── search/                   # Beam search
+├── profiler/                 # Compilation + profiling
+└── eval/                     # Correctness + benchmarking
+```
