@@ -2,42 +2,170 @@
 
 Author: Dev Desai
 
-KernelPilot is an autonomous CUDA kernel optimization system for WaferBench-style NVFP4 workloads on NVIDIA Blackwell hardware. It takes a reference kernel, studies the kernel and hardware context, proposes optimization directions with LLM agents, compiles candidate kernels, validates numerical correctness, profiles performance, and returns the best verified implementation.
+KernelPilot is an autonomous CUDA kernel optimization system built to answer a hard systems question:
 
-The repository is centered on three reference workloads:
+Can an LLM-driven search stack take a real reference kernel, reason about GPU bottlenecks, synthesize better CUDA, validate correctness, and beat a production baseline without human-written kernel-specific optimization plans?
 
-- `add_rmsnorm`: fused add + RMSNorm + NVFP4 quantization
-- `nvfp4_quantize`: BF16 to NVFP4 block quantization
-- `silu_mul`: fused SiLU and elementwise multiply with NVFP4 quantization
+This repository is my answer to that question.
 
-The project combines multi-agent planning, beam-search style exploration, hardware-aware profiling, correctness checks, and retrieval-augmented context from real CUDA codebases.
+It combines multi-agent planning, profiler-guided refinement, retrieval-augmented CUDA knowledge, benchmark discipline, and correctness gating into a single end-to-end optimization pipeline for Blackwell-class NVFP4 workloads.
 
-## What This Repository Does
+## Executive Summary
 
-KernelPilot is designed to answer a specific question: given a baseline CUDA kernel and a concrete target shape, can an automated system generate a faster version without breaking correctness?
+KernelPilot is not a prompt wrapper around `nvcc`. It is a research-style optimization engine with five tightly integrated pieces:
 
-At a high level, the system:
+- a planner that forms optimization hypotheses from source code, runtime signals, and retrieved CUDA patterns
+- a coder that turns those hypotheses into compilable CUDA kernels
+- a search loop that explores, ranks, prunes, and refines branches
+- a measurement layer that checks correctness and times candidates against a strong baseline
+- a feedback loop that uses profiler evidence instead of generic “optimize this kernel” advice
 
-1. Loads a kernel task definition and problem shape.
-2. Measures an official FlashInfer baseline when available.
-3. Builds an optimization environment with hardware, search, and evaluation constraints.
-4. Uses planner and coder agents to generate candidate kernels.
-5. Compiles and benchmarks those candidates on GPU.
-6. Rejects incorrect, slower, or suspicious implementations.
-7. Iterates on promising candidates until the search budget is exhausted.
-8. Emits the best validated kernel and a formatted submission artifact.
+The target workloads are:
 
-The emphasis is not just code generation. The repository includes the machinery needed to make automated optimization credible:
+- fused `add_rmsnorm` with NVFP4 quantization
+- `nvfp4_quantize` block quantization
+- fused `silu_mul` with NVFP4 quantization
 
-- benchmark parity against the production baseline
-- correctness validation across seeded runs
-- profiler-driven feedback
-- search branching and pruning
-- retrieval of external CUDA patterns through Pinecone-backed RAG
+The reported repository results show up to `1.845x` speedup over the production baseline on NVIDIA B200, with an approximate geometric mean of `1.61x` across the benchmarked kernels.
 
-## Current Scope
+## Research Hypothesis
 
-The executable entry point in [run.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/run.py) defines six task variants:
+My working hypothesis for this project is:
+
+An autonomous optimization loop can outperform strong baseline CUDA kernels if it is given four things at once:
+
+1. real runtime evidence instead of static code-only reasoning
+2. search diversity instead of single-shot generation
+3. correctness and anti-hack filters as hard gates
+4. external retrieval over high-quality CUDA sources so the model is not reasoning in a vacuum
+
+This repository operationalizes that hypothesis. Every major subsystem exists to make one part of that claim testable.
+
+## Why This Project Is Hard
+
+Autonomous kernel optimization is difficult for reasons that compound:
+
+- CUDA kernels are tightly coupled to hardware behavior, occupancy, register pressure, memory traffic, and launch geometry
+- small source changes can produce large performance cliffs
+- generated kernels often compile but are numerically wrong
+- benchmark numbers are easy to inflate with unfair baselines or mismatched timing paths
+- LLMs are prone to generic advice, hallucinated intrinsics, and unstable code revisions if the loop is under-constrained
+
+KernelPilot addresses those issues with disciplined structure:
+
+- official-baseline-first evaluation
+- branch-based search instead of one-shot sampling
+- seeded correctness checks
+- runtime and profiler feedback
+- RAG over real CUDA sources
+- explicit retirement of stagnant candidate families
+
+## Architecture
+
+### System View
+
+```mermaid
+flowchart TD
+    A["Reference Kernel + Problem Shape"] --> B["run.py"]
+    B --> C["Baseline Measurement"]
+    C --> D["RLMEnvironment"]
+    D --> E["BeamSearch"]
+    E --> F["Planner"]
+    F --> G["RAG Retriever + CUDA Docs"]
+    F --> H["Coder"]
+    H --> I["nvcc Compile"]
+    I --> J["Benchmark"]
+    J --> K["Correctness Check"]
+    K --> L["Hybrid Profiler"]
+    L --> M["Reflector / Feedback"]
+    M --> E
+    E --> N["Best Verified Candidate"]
+    N --> O["Submission Formatter"]
+```
+
+### Search Loop
+
+```mermaid
+flowchart LR
+    A["Planner Hypothesis"] --> B["Candidate CUDA"]
+    B --> C["Compile"]
+    C --> D["Time vs Baseline"]
+    D --> E["Correctness Gate"]
+    E --> F["Profiler Signals"]
+    F --> G["Refinement Feedback"]
+    G --> H["Next Branch / Retry / Retire"]
+    H --> A
+```
+
+### Core Idea
+
+The architecture is deliberately modular:
+
+- `rlm/` owns reasoning, prompts, environment state, planning, and feedback synthesis
+- `search/` owns branching, diversity, ranking, and search progression
+- `profiler/` owns bottleneck evidence and hybrid performance analysis
+- `eval/` owns fairness, timing, correctness, and submission formatting
+- `kernels/` provides the baseline kernels and shared CUDA support headers
+
+That separation matters because it makes the system inspectable. A hiring manager or reviewer can look at each layer independently and understand how decisions are made.
+
+## Results
+
+The repository’s benchmark history reports the following results on NVIDIA B200 against FlashInfer production baselines:
+
+| Kernel | Shape | Speedup |
+| --- | --- | --- |
+| `add_rmsnorm_fp4quant` | `128 x 2048` | `1.691x` |
+| `add_rmsnorm_fp4quant` | `128 x 4096` | `1.650x` |
+| `add_rmsnorm_fp4quant` | `128 x 8192` | `1.420x` |
+| `nvfp4_quantize` | `128 x 14336` | `1.845x` |
+| `silu_mul_fp4quant` | `8 x 256 x 7168` | `1.450x` |
+
+Approximate geometric mean: `1.61x`
+
+These numbers matter for two reasons:
+
+- the comparison target is not a toy baseline; it is a production-oriented FlashInfer reference path
+- the system is solving multiple kernel families rather than one hand-tuned benchmark
+
+## What The System Actually Discovers
+
+KernelPilot is intended to discover patterns such as:
+
+- vectorized loads and stores
+- hardware FP4 intrinsic usage on Blackwell
+- better thread utilization when work mapping leaves idle lanes
+- register caching to avoid repeated global reads
+- launch-bound and occupancy-aware refinements
+- dataflow simplifications that reduce unnecessary passes
+
+The point is not that every candidate will discover every pattern. The point is that the system is structured so those patterns can emerge from runtime-grounded search instead of being hardcoded into a kernel-specific script.
+
+## Benchmark Discipline
+
+Performance claims are only interesting if the measurement path is credible.
+
+KernelPilot takes that seriously:
+
+- it attempts to use an official FlashInfer baseline first
+- it marks fallback reference baselines as unofficial
+- it reuses a consistent timing path between baseline and candidate
+- it validates correctness before accepting a kernel as a win
+- it records profiler and compiler evidence for follow-up reasoning
+
+Important configured evaluation thresholds:
+
+- absolute tolerance: `1e-2`
+- relative tolerance: `1e-3`
+- correctness seeds: `42`, `123`, `999`
+- benchmark warmup iterations: `500`
+- benchmark iterations: `100`
+
+This is one of the strongest parts of the project from a systems-engineering perspective: the code does not treat “compiled once” as success.
+
+## The Optimization Pipeline
+
+At the top level, [run.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/run.py) defines six task variants:
 
 - `add_rmsnorm_fp4quant_b128xh2048`
 - `add_rmsnorm_fp4quant_b128xh4096`
@@ -46,197 +174,118 @@ The executable entry point in [run.py](/Users/DEVDESAI1/Desktop/University_at_Bu
 - `silu_mul_fp4quant_b8xm256xk7168`
 - `silu_mul_fp4quant_b8xm256xk14336`
 
-Each task maps to a reference kernel source file under `kernels/reference/` and a specific shape tuple passed through the optimization pipeline.
+For each task, the runtime flow is:
 
-## Architecture
+1. load configuration and environment variables
+2. resolve the kernel source and shape
+3. measure a baseline
+4. create an `RLMEnvironment`
+5. run `BeamSearch`
+6. validate the best candidate with correctness checks
+7. benchmark the final candidate
+8. format and save the output submission
 
-KernelPilot is organized into a few major subsystems:
+## Repository Breakdown
 
-- `rlm/`: agent prompts, orchestration, planner logic, feedback generation, environment state, and RAG integration
-- `search/`: beam search, diversity handling, candidate combination, and branch management
-- `profiler/`: compilation and profiling helpers, including hybrid hardware analysis
-- `eval/`: benchmarking, correctness validation, FlashInfer baseline measurement, and submission formatting
-- `kernels/`: shared CUDA headers plus baseline reference kernels
-- `config/`: model, beam, profiler, RAG, and evaluation settings
+### `rlm/`
 
-The control flow is roughly:
+This is the reasoning core of the project.
 
-```text
-run.py
-  -> load config + environment
-  -> measure official baseline
-  -> initialize RLMEnvironment
-  -> run BeamSearch
-  -> validate best candidate
-  -> benchmark final candidate
-  -> format and save submission
-```
+- [rlm/engine.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/engine.py): orchestration, decomposition, prompt building, multi-turn refinement, and tool routing
+- [rlm/planner.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/planner.py): branch planning and direction setting
+- [rlm/planner_spec.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/planner_spec.py): structured planning schema and instruction shaping
+- [rlm/coder.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/coder.py): code-generation prompt construction
+- [rlm/fixer.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/fixer.py): repair prompts for failed candidates
+- [rlm/reflector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/reflector.py): converts measured outcomes into refinement guidance
+- [rlm/feedback.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/feedback.py): runtime-grounded targeted feedback
+- [rlm/environment.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/environment.py): per-run state, counters, metrics, branch memory, and config handling
 
-Within search, the pipeline looks like:
+### `search/`
 
-```text
-Planner -> Coder -> nvcc compile -> benchmark -> correctness -> profiler feedback -> refinement
-```
+This is the search-control layer.
 
-## Core Modules
+- [search/beam_search.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/beam_search.py): branch exploration, candidate timing, pruning, early stopping, and search progression
+- [search/diversity_selector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/diversity_selector.py): preserves strategy diversity across candidates
+- [search/combiner.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/combiner.py): combines strong candidates into merged variants
+- [search/strategy_bank.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/strategy_bank.py): strategy catalog for CUDA optimization ideas
 
-### Entry and task orchestration
+### `profiler/`
 
-- [run.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/run.py): CLI entry point, task definitions, baseline handling, output generation, and top-level execution flow
-- [rlm/environment.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/environment.py): state container for each optimization session, including search configuration, metrics, counters, and persistent branch information
-- [rlm/env_loader.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/env_loader.py): project-level `.env` loading
+This is the evidence layer.
 
-### Agent and prompt system
+- [profiler/kernel_profiler.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/kernel_profiler.py): compile-and-profile orchestration
+- [profiler/hybrid_profiler.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/hybrid_profiler.py): hybrid bottleneck analysis
+- [profiler/roofline.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/roofline.py): roofline model support for B200
+- [profiler/metrics.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/metrics.py): metric schema
 
-- [rlm/engine.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/engine.py): main orchestration logic, prompt construction, tool exposure, decomposition, refinement, and multi-turn agent execution
-- [rlm/planner.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/planner.py): branch planning and direction-setting logic
-- [rlm/planner_spec.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/planner_spec.py): structured planner instructions and plan schema support
-- [rlm/root_prompts.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/root_prompts.py): root-level prompt templates
-- [rlm/sub_prompts.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/sub_prompts.py): branch and sub-agent prompt builders
-- [rlm/coder.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/coder.py): code-generation prompt logic
-- [rlm/fixer.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/fixer.py): repair-oriented prompt construction
-- [rlm/reflector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/reflector.py): refinement feedback shaping around measured outcomes
-- [rlm/feedback.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/feedback.py): targeted runtime-grounded feedback and experimental next-step framing
+### `eval/`
 
-### Search and candidate management
+This is the fairness and safety layer.
 
-- [search/beam_search.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/beam_search.py): main search loop, branch expansion, candidate timing, pruning, and stopping rules
-- [search/diversity_selector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/diversity_selector.py): family-aware diversity preservation
-- [search/combiner.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/combiner.py): top-candidate combination logic
-- [search/strategy_bank.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/search/strategy_bank.py): optimization strategy catalog
+- [eval/benchmark.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/benchmark.py): timing harness and summary metrics
+- [eval/correctness.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/correctness.py): seeded correctness validation
+- [eval/flashinfer_ref.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/flashinfer_ref.py): official baseline path
+- [eval/runtime_checks.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/runtime_checks.py): runtime validation
+- [eval/hack_detector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/hack_detector.py): anti-cheat / anti-trivial-solution filtering
+- [eval/waferbench_format.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/waferbench_format.py): output formatting
 
-### Profiling and evaluation
+### `kernels/`
 
-- [profiler/kernel_profiler.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/kernel_profiler.py): compilation and profiling orchestration
-- [profiler/hybrid_profiler.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/hybrid_profiler.py): hybrid analysis layer combining measured and inferred bottleneck signals
-- [profiler/roofline.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/roofline.py): B200 roofline support
-- [profiler/metrics.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/metrics.py): structured profiler metric definitions
-- [profiler/validate_hybrid.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/validate_hybrid.py): validation helper for hybrid profiling output
-- [eval/benchmark.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/benchmark.py): timing harness and aggregate result helpers
-- [eval/correctness.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/correctness.py): correctness checker and seeded numerical validation
-- [eval/flashinfer_ref.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/flashinfer_ref.py): official baseline measurement path
-- [eval/runtime_checks.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/runtime_checks.py): runtime safety and kernel-specific validation helpers
-- [eval/hack_detector.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/hack_detector.py): trivial or invalid optimization detection
-- [eval/waferbench_format.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/waferbench_format.py): final result formatting and output persistence
-
-### RAG and external knowledge
-
-- [rlm/rag_retriever.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/rag_retriever.py): Pinecone retrieval, source filtering, ranking, and formatting
-- [rlm/query_embedder.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/query_embedder.py): embedding support for retrieval
-- [rlm/cuda_docs.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/cuda_docs.py): CUDA doc search support
-- `rlm/knowledge_base/`: curated local notes on FP4 intrinsics, cache streaming, multi-row processing, and shape-specialized unroll patterns
-
-## Reference Kernels and CUDA Support Code
-
-The baseline kernels live in:
+These files provide the actual optimization targets and shared CUDA utilities:
 
 - [kernels/reference/add_rmsnorm.cu](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/kernels/reference/add_rmsnorm.cu)
 - [kernels/reference/nvfp4_quantize.cu](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/kernels/reference/nvfp4_quantize.cu)
 - [kernels/reference/silu_mul.cu](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/kernels/reference/silu_mul.cu)
-
-Shared CUDA helpers live in:
-
 - [kernels/common/nvfp4_utils.cuh](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/kernels/common/nvfp4_utils.cuh)
 - [kernels/common/b200_intrinsics.cuh](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/kernels/common/b200_intrinsics.cuh)
 
-These files provide the primitive building blocks the agents are expected to exploit, including FP4 packing paths, Blackwell-specific intrinsics, and utility routines needed by the reference workloads.
+## RAG and External Knowledge
 
-## Search Configuration
+KernelPilot uses Pinecone-backed retrieval so the planner is not relying only on latent model memory.
 
-The active default configuration in [config/search_config.yaml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/config/search_config.yaml) is intentionally conservative:
-
-- beam width: `1`
-- refinement rounds: `0`
-- maximum concurrent API calls: `4`
-- `combine_top_k`: `2`
-- diversity mode: `family_diverse`
-- tree branching factor: `2`
-- tree speedup threshold: `1.0`
-- profiler tool: `hybrid`
-- profile workers: `2`
-- target minimum speedup: `1.5x`
-
-Model configuration is currently centered on `claude-haiku-4-5-20251001` for planner, coder, fixer, root, sub, and combine roles. That means the system is wired for cost-sensitive iteration by default, even though the rest of the codebase still supports a much richer multi-round search flow.
-
-This is important context when reading benchmark numbers or expected behavior: the codebase supports a deeper search tree than the default runtime settings currently enable.
-
-## RAG Pipeline
-
-KernelPilot uses Pinecone-backed retrieval to supply examples and patterns from real CUDA sources to the planner.
-
-Current RAG settings include:
+Current configuration in [config/search_config.yaml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/config/search_config.yaml):
 
 - provider: `pinecone`
 - index: `cuda-kernels-v2`
-- top-k retrieval: `4`
+- top-k: `4`
 - rerank pool: `25`
 - text field: `source_code`
 - source cap: `1`
 
-The retrieval system is built to:
+Supporting files:
 
-1. embed a query derived from kernel type, shape, and performance signals
-2. search the configured Pinecone index
-3. rerank matches using metadata and source quality
-4. format the most relevant snippets for planner consumption
-5. expose targeted documentation lookup during agent execution
+- [rlm/rag_retriever.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/rag_retriever.py)
+- [rlm/query_embedder.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/query_embedder.py)
+- [rlm/cuda_docs.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/rlm/cuda_docs.py)
+- [check_pinecone.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/check_pinecone.py)
+- [migrate_pinecone.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/migrate_pinecone.py)
 
-Supporting tools and scripts:
+The intent is simple: when the model proposes a change, it should do so with relevant examples and hardware-aware context, not vague CUDA folklore.
 
-- [check_pinecone.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/check_pinecone.py): verifies index connectivity and configuration
-- [migrate_pinecone.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/migrate_pinecone.py): migration helper for index evolution
-- [branches/add_rmsnorm_combined_fix.json](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/branches/add_rmsnorm_combined_fix.json): branch data artifact used by one of the search workflows
+## Configuration Philosophy
 
-## Evaluation Methodology
+The active default settings are intentionally conservative:
 
-The repository makes a serious attempt to avoid inflated speedup claims.
+- beam width: `1`
+- refinement rounds: `0`
+- max concurrent API calls: `4`
+- combine top-k: `2`
+- diversity mode: `family_diverse`
+- hybrid profiler enabled
+- target minimum speedup: `1.5x`
 
-Baseline measurement:
+That means the codebase currently contains more search sophistication than the default runtime path exercises.
 
-- tries to use an official FlashInfer implementation first
-- falls back to the local reference kernel only when explicitly allowed
-- records whether the baseline is official or unofficial
+This is actually a useful signal for a reviewer:
 
-Candidate evaluation:
+- the architecture is capable of deeper search
+- the current defaults are set for controlled, cost-aware iteration
+- the repository is structured so scaling experimentation is a config problem, not a rewrite
 
-- compiles generated CUDA code
-- benchmarks using the same measurement path used for the baseline
-- runs correctness checks against expected outputs
-- captures profiler and compiler evidence for the next refinement step
+## Setup
 
-Important thresholds from configuration:
+From [pyproject.toml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/pyproject.toml), the project expects Python `>=3.10` and depends on:
 
-- correctness absolute tolerance: `1e-2`
-- correctness relative tolerance: `1e-3`
-- correctness seeds: `42`, `123`, `999`
-- benchmark warmup iterations: `500`
-- benchmark iterations: `100`
-
-The code also includes GPU clock locking support in `run.py` to reduce variance when the environment allows it.
-
-## Benchmark Results Recorded in the Repository
-
-The existing project README history recorded the following headline results on NVIDIA B200:
-
-| Kernel | Shape | Speedup |
-| --- | --- | --- |
-| add_rmsnorm_fp4quant | 128x2048 | 1.691x |
-| add_rmsnorm_fp4quant | 128x4096 | 1.650x |
-| add_rmsnorm_fp4quant | 128x8192 | 1.420x |
-| nvfp4_quantize | 128x14336 | 1.845x |
-| silu_mul_fp4quant | 8x256x7168 | 1.450x |
-
-That yields an approximate geometric mean of `1.61x` over the reported FlashInfer baselines.
-
-These figures are useful as repository context, but they should still be treated as run-dependent until reproduced in your target environment with the current configuration.
-
-## Installation
-
-### Python requirements
-
-From [pyproject.toml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/pyproject.toml):
-
-- Python `>=3.10`
 - `anthropic`
 - `pyyaml`
 - `numpy`
@@ -245,30 +294,17 @@ From [pyproject.toml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/Ke
 - `torch`
 - `flashinfer`
 
-The lightweight [requirements.txt](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/requirements.txt) currently lists the non-heavy subset:
-
-- `anthropic`
-- `pyyaml`
-- `numpy`
-- `pinecone`
-- `sentence-transformers`
+The lighter [requirements.txt](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/requirements.txt) captures the non-heavy subset.
 
 Install with:
 
 ```bash
 pip install -r requirements.txt
 pip install torch flashinfer
-```
-
-If you want the package entry point:
-
-```bash
 pip install -e .
 ```
 
-## Environment Variables
-
-At minimum, expect to provide:
+Environment variables:
 
 ```bash
 ANTHROPIC_API_KEY=...
@@ -277,7 +313,7 @@ PINECONE_INDEX_NAME=cuda-kernels-v2
 PINECONE_INDEX_HOST=...
 ```
 
-The configuration also supports environment overrides for:
+Additional supported environment overrides:
 
 - `PINECONE_NAMESPACE`
 - `PINECONE_EMBED_PROVIDER`
@@ -286,31 +322,31 @@ The configuration also supports environment overrides for:
 
 ## Usage
 
-Optimize all tasks:
+Optimize all kernels:
 
 ```bash
 python run.py
 ```
 
-Optimize a single task:
+Optimize a single kernel:
 
 ```bash
 python run.py --kernel add_rmsnorm_fp4quant_b128xh2048
 ```
 
-Validate setup without calling the model:
+Dry run without model calls:
 
 ```bash
 python run.py --dry-run
 ```
 
-Override beam settings from the CLI:
+Override search depth:
 
 ```bash
 python run.py --beam-width 2 --rounds 2
 ```
 
-Allow a non-official fallback baseline for local experimentation:
+Allow unofficial local fallback baseline:
 
 ```bash
 python run.py --allow-reference-baseline
@@ -318,61 +354,47 @@ python run.py --allow-reference-baseline
 
 ## Outputs
 
-By default, the system writes submission artifacts under `outputs/submissions` and logs to `rlm_optimizer.log`.
+The runtime emits submission artifacts and logs, including metadata such as:
 
-The formatted submission metadata includes fields such as:
-
-- chosen strategy
+- selected strategy
 - bottleneck classification
+- correctness pass/fail state
+- max absolute error
 - official-baseline flag
-- search rounds used
+- search rounds completed
 - cumulative API cost
-- elapsed time
-- correctness status
-- maximum absolute error
-- rejection counts and attempt counters
+- elapsed runtime
+- rejection and attempt counters
 
-This makes the outputs useful both as benchmark artifacts and as postmortem material for search behavior.
+This makes the output useful for both benchmarking and postmortem analysis.
 
-## Testing and Utility Scripts
+## Why This Is Worth Sharing
 
-The repository includes helper scripts and tests that are part of the development workflow:
+If I were evaluating this project as a hiring manager, the impressive parts are not just the speedups.
 
-- [test_llm_codegen.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/test_llm_codegen.py): end-to-end or semi-structured codegen testing
-- [test_llm_picks.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/test_llm_picks.py): strategy-selection evaluation
-- [scripts/coder_sandbox_check.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/scripts/coder_sandbox_check.py): sandbox-oriented coder validation
-- [scripts/agent_checks.sh](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/scripts/agent_checks.sh): shell-level validation helpers
+The stronger signal is the engineering judgment behind the system:
 
-## Design Philosophy
+- it treats measurement rigor as part of the product
+- it separates reasoning, search, profiling, and evaluation concerns cleanly
+- it builds an autonomous loop that still remains inspectable
+- it uses retrieval and profiler evidence to make LLM output less hand-wavy
+- it targets difficult, hardware-sensitive optimization problems rather than easy prompt demos
 
-A few themes show up consistently across the codebase:
-
-- measure against a real baseline instead of trusting intuition
-- prefer runtime-grounded feedback over generic optimization advice
-- keep the planner informed by retrieval and profiler evidence
-- separate planning, coding, fixing, and reflection responsibilities
-- preserve diversity in candidate search rather than overcommitting to one idea too early
-- treat correctness as a hard gate, not a secondary concern
-
-This makes KernelPilot more than a prompt wrapper around `nvcc`. It is an attempt to build a disciplined, inspectable optimization loop for CUDA kernels under realistic benchmark pressure.
+This repository is meant to show taste in systems design as much as raw implementation ability.
 
 ## Limitations
 
-KernelPilot is powerful, but it is not plug-and-play on arbitrary machines.
+KernelPilot is ambitious, but it is not pretending to be effortless.
 
-Key constraints:
+- it requires meaningful NVIDIA GPU access
+- many optimizations are Blackwell and NVFP4 specific
+- reproducibility depends on driver, toolchain, FlashInfer, and hardware setup
+- external services are part of the current architecture
+- benchmark claims should still be reproduced in the target environment
 
-- it assumes NVIDIA GPU access for meaningful execution
-- many paths are Blackwell and NVFP4 specific
-- FlashInfer availability changes whether results are considered official
-- the best results depend on external services such as Anthropic and Pinecone
-- the default config currently runs a narrower search than the full architecture supports
+## Recommended Reading Order
 
-If you are reproducing results, pay close attention to GPU model, driver/toolchain compatibility, FlashInfer installation, and current search settings.
-
-## Recommended First Read
-
-If you are onboarding to the repository, read in this order:
+If you are reviewing the repository quickly, read these first:
 
 1. [run.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/run.py)
 2. [config/search_config.yaml](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/config/search_config.yaml)
@@ -381,4 +403,9 @@ If you are onboarding to the repository, read in this order:
 5. [profiler/hybrid_profiler.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/profiler/hybrid_profiler.py)
 6. [eval/correctness.py](/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/KernelPilot/eval/correctness.py)
 
-That sequence gives the clearest picture of how tasks are defined, how search proceeds, how candidates are judged, and how results are finalized.
+That path gives the clearest story:
+
+- what problem the system solves
+- how it searches
+- how it measures success
+- how it avoids fooling itself
